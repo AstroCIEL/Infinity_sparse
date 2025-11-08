@@ -228,7 +228,7 @@ if __name__ == '__main__':
                     continue
             
             if args.coco30k_prompts or args.save4fid_eval:
-                concate_img = gen_one_img(infinity, vae, text_tokenizer, text_encoder, prompt, g_seed=0, gt_leak=0, gt_ls_Bl=gt_ls_Bl, t5_path=None, tau_list=args.tau, cfg_sc=3, cfg_list=args.cfg, scale_schedule=scale_schedule, cfg_insertion_layer=[args.cfg_insertion_layer], vae_type=args.vae_type, sampling_per_bits=args.sampling_per_bits)
+                concate_img = gen_one_img(infinity, vae, text_tokenizer, text_encoder, prompt, g_seed=0, gt_leak=0, gt_ls_Bl=gt_ls_Bl, tau_list=args.tau, cfg_sc=3, cfg_list=args.cfg, scale_schedule=scale_schedule, cfg_insertion_layer=[args.cfg_insertion_layer], vae_type=args.vae_type, sampling_per_bits=args.sampling_per_bits)
             else:
                 g_seed = 0 if args.n_samples == 1 else None
                 tmp_img_list = []

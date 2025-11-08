@@ -19,6 +19,7 @@ from flash_attn import flash_attn_func                  # q, k, or v: BLHc, ret:
 from flash_attn import flash_attn_varlen_kvpacked_func  # qkv: N3Hc, ret: NHc
 
 from torch.nn.functional import scaled_dot_product_attention as slow_attn    # q, k, v: BHLc
+from typing import Union, Tuple
 
 # Import flash_attn's fused ops
 try:
@@ -237,8 +238,32 @@ class SelfAttention(nn.Module):
         self.pad_to_multiplier = pad_to_multiplier
 
         self.rope2d_normalized_by_hw = rope2d_normalized_by_hw
-
+        
+        self.return_attention = False
+        self.attention_weights = None
+        self.attention_hooks = []
+        
+    def set_return_attention(self, return_attention=True):
+        """设置是否返回attention map"""
+        self.return_attention = return_attention
     
+    def _attention_hook(self, module, input, output):
+        """捕获attention weights的hook函数"""
+        if self.return_attention and hasattr(module, 'attention_weights'):
+            self.attention_weights = module.attention_weights.detach().cpu()
+    
+    def register_attention_hook(self):
+        """注册attention hook"""
+        if self.return_attention:
+            # 清除之前的hook
+            for hook in self.attention_hooks:
+                hook.remove()
+            self.attention_hooks = []
+            
+            # 注册forward hook来捕获attention weights
+            hook = self.register_forward_hook(self._attention_hook)
+            self.attention_hooks.append(hook)
+
     def kv_caching(self, enable: bool): # kv caching: only used during inference
         self.caching = enable
         self.cached_k = None
@@ -290,9 +315,10 @@ class SelfAttention(nn.Module):
         if rope2d_freqs_grid is not None:
             q, k = apply_rotary_emb(q, k, scale_schedule, rope2d_freqs_grid, self.pad_to_multiplier, self.rope2d_normalized_by_hw, scale_ind) #, freqs_cis=freqs_cis)
         if self.caching:    # kv caching: only used during inference
-            if self.cached_k is None: self.cached_k = k; self.cached_v = v
-            else: k = self.cached_k = torch.cat((self.cached_k, k), dim=L_dim); v = self.cached_v = torch.cat((self.cached_v, v), dim=L_dim)
-        
+            self.cached_k = torch.cat((self.cached_k, k), dim=L_dim) if self.cached_k is not None else k
+            self.cached_v = torch.cat((self.cached_v, v), dim=L_dim) if self.cached_v is not None else v
+            k, v = self.cached_k, self.cached_v
+                   
         if self.using_flash:
             if attn_bias_or_two_vector is not None: # training
                 kw = dict(VAR_visible_kvlen=attn_bias_or_two_vector[0], VAR_invisible_qlen=attn_bias_or_two_vector[1])
@@ -307,12 +333,229 @@ class SelfAttention(nn.Module):
             else:
                 oup = slow_attn(query=q, key=k, value=v, scale=self.scale, attn_mask=attn_bias_or_two_vector, dropout_p=0).transpose(1, 2).reshape(B, L, C)
             # oup: bf16
+            
+        if self.return_attention and not self.using_flash and not self.use_flex_attn:
+            # 计算原始attention weights（用于分析）
+            attn_scores = torch.matmul(q, k.transpose(-2, -1)) * self.scale
+            if attn_bias_or_two_vector is not None:
+                attn_scores = attn_scores + attn_bias_or_two_vector
+            self.attention_weights = F.softmax(attn_scores, dim=-1)
         
         return self.proj_drop(self.proj(oup))
     
     def extra_repr(self) -> str:
         tail = ''
         return f'using_flash={self.using_flash}, tau={self.tau}, cos_attn={self.cos_attn}{tail}'
+
+class SparseSelfAttention(nn.Module):
+    def __init__(
+        self, embed_dim=768, num_heads=12,
+        proj_drop=0., tau=1, cos_attn=False, customized_flash_attn=True, use_flex_attn=False, 
+        batch_size=2, pad_to_multiplier=1, rope2d_normalized_by_hw=0, sparsity_ratio=0.25
+    ):
+        """
+        带有25%稀疏性的SelfAttention实现
+        """
+        super().__init__()
+        assert embed_dim % num_heads == 0
+        self.using_flash = customized_flash_attn
+        self.sparsity_ratio = sparsity_ratio
+        
+        self.num_heads, self.head_dim = num_heads, embed_dim // num_heads
+        self.tau, self.cos_attn = tau, cos_attn
+        if self.cos_attn:
+            self.scale = 1
+            size = (1, 1, self.num_heads, 1) if self.using_flash else (1, self.num_heads, 1, 1)
+            self.scale_mul_1H11 = nn.Parameter(torch.full(size=size, fill_value=4.0).log(), requires_grad=True)
+            self.max_scale_mul = torch.log(torch.tensor(100)).item()
+        else:
+            self.scale = 1 / math.sqrt(self.head_dim) / self.tau
+        
+        self.mat_qkv = nn.Linear(embed_dim, embed_dim * 3, bias=False)
+        self.q_bias, self.v_bias = nn.Parameter(torch.zeros(embed_dim)), nn.Parameter(torch.zeros(embed_dim))
+        self.register_buffer('zero_k_bias', torch.zeros(embed_dim))
+        
+        self.proj = nn.Linear(embed_dim, embed_dim)
+        self.proj_drop = get_dropout_layer(proj_drop)
+        
+        self.caching = False
+        self.cached_k = None
+        self.cached_v = None
+
+        self.batch_size = batch_size
+        self.use_flex_attn = use_flex_attn
+        self.pad_to_multiplier = pad_to_multiplier
+        self.rope2d_normalized_by_hw = rope2d_normalized_by_hw
+        
+        self.return_attention = False
+        self.attention_weights = None
+        self.attention_hooks = []
+        self.sparsity_mask = None
+        
+    def set_return_attention(self, return_attention=True):
+        self.return_attention = return_attention
+    
+    def _attention_hook(self, module, input, output):
+        if self.return_attention and hasattr(module, 'attention_weights'):
+            self.attention_weights = module.attention_weights.detach().cpu()
+    
+    def register_attention_hook(self):
+        if self.return_attention:
+            for hook in self.attention_hooks:
+                hook.remove()
+            self.attention_hooks = []
+            hook = self.register_forward_hook(self._attention_hook)
+            self.attention_hooks.append(hook)
+
+    def kv_caching(self, enable: bool):
+        self.caching = enable
+        self.cached_k = None
+        self.cached_v = None
+    
+    def _apply_sparsity_to_attention(self, attention_weights, sparsity_ratio=0.25):
+        """
+        对attention weights应用稀疏性，将最小的sparsity_ratio比例的值设为0
+        """
+        if sparsity_ratio <= 0:
+            return attention_weights, torch.zeros_like(attention_weights, dtype=torch.bool)
+        
+        # attention_weights形状: (batch_size, num_heads, seq_len_q, seq_len_k)
+        batch_size, num_heads, seq_len_q, seq_len_k = attention_weights.shape
+        
+        # 创建副本以避免原地修改
+        attn_sparse = attention_weights.clone()
+        sparsity_mask = torch.zeros_like(attention_weights, dtype=torch.bool)
+        
+        # 对每个查询位置独立应用稀疏性
+        for b in range(batch_size):
+            for h in range(num_heads):
+                for q in range(seq_len_q):
+                    attn_row = attn_sparse[b, h, q]  # (seq_len_k,)
+                    
+                    # 计算要保留的最小值数量
+                    k = max(1, int(seq_len_k * (1 - sparsity_ratio)))
+                    if k >= seq_len_k:  # 稀疏比例太小，跳过
+                        continue
+                    
+                    # 找到第k小的值作为阈值
+                    values, indices = torch.topk(attn_row, k, largest=True)
+                    threshold = values[-1] if k > 0 else torch.tensor(0.0)
+                    
+                    # 创建当前行的mask
+                    row_mask = attn_row < threshold
+                    # 应用稀疏性
+                    attn_sparse[b, h, q] = attn_row.masked_fill(row_mask, 0.0)
+                    # 更新sparsity mask
+                    sparsity_mask[b, h, q] = row_mask
+                    
+                    # 重新归一化
+                    row_sum = attn_sparse[b, h, q].sum()
+                    if row_sum > 0:
+                        attn_sparse[b, h, q] = attn_sparse[b, h, q] / row_sum
+                    else:
+                        # 如果全为0，则恢复原始值（避免除零）
+                        attn_sparse[b, h, q] = attention_weights[b, h, q] / attention_weights[b, h, q].sum()
+        
+        return attn_sparse, sparsity_mask
+    
+    def _sparse_dot_product_attention(self, query, key, value, attn_mask=None, scale=None):
+        """
+        实现稀疏的scaled dot-product attention
+        """
+        if scale is None:
+            scale = 1.0 / math.sqrt(query.size(-1))
+        
+        # 计算attention scores
+        attn_scores = torch.matmul(query, key.transpose(-2, -1)) * scale
+        
+        # 应用attention mask（如果有）
+        if attn_mask is not None:
+            attn_scores = attn_scores + attn_mask
+        
+        # 应用softmax得到attention weights
+        attn_weights = F.softmax(attn_scores, dim=-1)
+        
+        # 应用稀疏性
+        if self.sparsity_ratio > 0:
+            attn_weights_sparse, sparsity_mask = self._apply_sparsity_to_attention(attn_weights, self.sparsity_ratio)
+            # 保存sparsity mask（只保存第一个batch的作为示例）
+            self.sparsity_mask = sparsity_mask[0].detach().cpu()
+        else:
+            attn_weights_sparse = attn_weights
+            self.sparsity_mask = torch.zeros_like(attn_weights, dtype=torch.bool).detach().cpu()
+        
+        # 计算输出
+        output = torch.matmul(attn_weights_sparse, value)
+        
+        return output, attn_weights_sparse
+    
+    def forward(self, x, attn_bias_or_two_vector: Union[torch.Tensor, Tuple[torch.IntTensor, torch.IntTensor]], attn_fn=None, scale_schedule=None, rope2d_freqs_grid=None, scale_ind=0):
+        """
+        使用稀疏attention替换原来的slow_attn
+        """
+        B, L, C = x.shape
+        
+        # 计算QKV
+        qkv = F.linear(input=x, weight=self.mat_qkv.weight, bias=torch.cat((self.q_bias, self.zero_k_bias, self.v_bias))).view(B, L, 3, self.num_heads, self.head_dim)
+        
+        if self.using_flash: 
+            q, k, v = qkv.unbind(dim=2)
+            L_dim = 1
+        else: 
+            q, k, v = qkv.permute(2, 0, 3, 1, 4).unbind(dim=0)
+            L_dim = 2
+        
+        if self.cos_attn:
+            scale_mul = self.scale_mul_1H11.clamp_max(self.max_scale_mul).exp()
+            q = F.normalize(q, dim=-1, eps=1e-12).mul(scale_mul).contiguous()
+            k = F.normalize(k, dim=-1, eps=1e-12).contiguous()
+            v = v.contiguous()
+        else:
+            q = q.contiguous()
+            k = k.contiguous()
+            v = v.contiguous()
+            
+        if rope2d_freqs_grid is not None:
+            q, k = apply_rotary_emb(q, k, scale_schedule, rope2d_freqs_grid, self.pad_to_multiplier, self.rope2d_normalized_by_hw, scale_ind)
+            
+        if self.caching:
+            self.cached_k = torch.cat((self.cached_k, k), dim=L_dim) if self.cached_k is not None else k
+            self.cached_v = torch.cat((self.cached_v, v), dim=L_dim) if self.cached_v is not None else v
+            k, v = self.cached_k, self.cached_v
+                   
+        if self.using_flash:
+            # 保持原来的flash attention逻辑
+            if attn_bias_or_two_vector is not None:
+                kw = dict(VAR_visible_kvlen=attn_bias_or_two_vector[0], VAR_invisible_qlen=attn_bias_or_two_vector[1])
+            else:
+                kw = dict()
+            oup = flash_attn_func(q.to(v.dtype), k.to(v.dtype), v, dropout_p=0, softmax_scale=self.scale, **kw).view(B, L, C)
+        else:
+            if self.use_flex_attn and attn_fn is not None:
+                # 使用flex attention
+                oup = attn_fn(q, k, v, scale=self.scale).transpose(1, 2).reshape(B, L, C)
+            else:
+                # 使用稀疏attention替换原来的slow_attn
+                oup, attn_weights = self._sparse_dot_product_attention(
+                    query=q, key=k, value=v, 
+                    attn_mask=attn_bias_or_two_vector, 
+                    scale=self.scale
+                )
+                oup = oup.transpose(1, 2).reshape(B, L, C)
+                
+                # 存储attention weights用于可视化
+                if self.return_attention:
+                    self.attention_weights = attn_weights.detach().cpu()
+            
+        return self.proj_drop(self.proj(oup))
+    
+    def extra_repr(self) -> str:
+        tail = f', sparsity_ratio={self.sparsity_ratio}'
+        return f'using_flash={self.using_flash}, tau={self.tau}, cos_attn={self.cos_attn}{tail}'
+    
+    def get_sparsity_mask(self):
+        """获取当前attention层的稀疏mask"""
+        return getattr(self, 'sparsity_mask', None)
 
 
 class CrossAttention(nn.Module):
@@ -355,8 +598,62 @@ class CrossAttention(nn.Module):
         
         self.proj = nn.Linear(embed_dim, embed_dim)
         self.proj_drop = get_dropout_layer(proj_drop)
+        
+        # 新增：用于存储cross attention map
+        self.return_attention = False
+        self.attention_weights = None
+        self.attention_hooks = []
     
-    def forward(self, q, ca_kv):
+    def set_return_attention(self, return_attention=True):
+        self.return_attention = return_attention
+    
+    def _attention_hook(self, module, input, output):
+        if self.return_attention and hasattr(module, 'attention_weights'):
+            self.attention_weights = module.attention_weights.detach().cpu()
+    
+    def register_attention_hook(self):
+        if self.return_attention:
+            for hook in self.attention_hooks:
+                hook.remove()
+            self.attention_hooks = []
+            hook = self.register_forward_hook(self._attention_hook)
+            self.attention_hooks.append(hook)
+            
+    def _compute_attention_weights_manually(self, q, k, v, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k):
+        """手动计算attention weights（当flash attention无法返回weights时使用）"""
+        B = len(cu_seqlens_q) - 1  # batch size
+        attention_maps = []
+        
+        # 对每个batch单独处理
+        for i in range(B):
+            start_q = cu_seqlens_q[i]
+            end_q = cu_seqlens_q[i+1]
+            start_k = cu_seqlens_k[i]
+            end_k = cu_seqlens_k[i+1]
+            
+            q_i = q[start_q:end_q]  # (Lq_i, num_heads, head_dim)
+            k_i = k[start_k:end_k]  # (Lk_i, num_heads, head_dim)
+            v_i = v[start_k:end_k]  # (Lk_i, num_heads, head_dim)
+            
+            Lq_i = q_i.shape[0]
+            Lk_i = k_i.shape[0]
+            
+            # 重新排列维度: (Lq_i, num_heads, head_dim) -> (num_heads, Lq_i, head_dim)
+            q_i = q_i.transpose(0, 1)
+            k_i = k_i.transpose(0, 1)
+            v_i = v_i.transpose(0, 1)
+            
+            # 计算attention scores
+            attn_scores = torch.matmul(q_i, k_i.transpose(-2, -1)) * self.scale  # (num_heads, Lq_i, Lk_i)
+            
+            # 应用softmax得到attention weights
+            attn_weights = F.softmax(attn_scores, dim=-1)  # (num_heads, Lq_i, Lk_i)
+            
+            attention_maps.append(attn_weights)
+        
+        return attention_maps
+    
+    def forward(self, q, ca_kv, return_attention=False):
         """
         :param q: shaped as (batch, seq_len, Q_dim)
         :param ca_kv: contains several vectors, each of which is shaped as (len_i, KV_dim). We have [len_1xKV_dim, len_2xKV_dim, len_3xKV_dim, ...] and lens == [len_1, len_2, len_3, ...]
@@ -392,29 +689,270 @@ class CrossAttention(nn.Module):
         kv_compact = kv_compact.contiguous()
         
         cu_seqlens_q = torch.arange(0, Lq * (B+1), Lq, dtype=torch.int32, device=q_compact.device)
-        if q_compact.dtype == torch.float32:    # todo: fp16 or bf16?
-            oup = flash_attn_varlen_kvpacked_func(q=q_compact.to(dtype=torch.bfloat16), kv=kv_compact.to(dtype=torch.bfloat16), cu_seqlens_q=cu_seqlens_q, cu_seqlens_k=cu_seqlens_k, max_seqlen_q=Lq, max_seqlen_k=max_seqlen_k, dropout_p=0, softmax_scale=self.scale).reshape(B, Lq, -1)
-            oup = oup.float()
-        else:
-            oup = flash_attn_varlen_kvpacked_func(q=q_compact, kv=kv_compact, cu_seqlens_q=cu_seqlens_q, cu_seqlens_k=cu_seqlens_k, max_seqlen_q=Lq, max_seqlen_k=max_seqlen_k, dropout_p=0, softmax_scale=self.scale).reshape(B, Lq, -1)
         
+        # 新增：如果需要返回attention weights，使用手动计算
+        if self.return_attention or return_attention:
+            # 分离k和v
+            k_compact, v_compact = kv_compact.unbind(dim=1)  # (N, num_heads, head_dim)
+            
+            # 手动计算attention weights
+            attention_maps = self._compute_attention_weights_manually(
+                q_compact, k_compact, v_compact, 
+                cu_seqlens_q, cu_seqlens_k, Lq, max_seqlen_k
+            )
+            
+            # 存储attention weights（只存储第一个batch的作为示例）
+            if attention_maps:
+                self.attention_weights = attention_maps[0]  # (num_heads, Lq, Lk) for first batch
+            
+            # 使用flash attention进行前向传播（保持性能）
+            if q_compact.dtype == torch.float32:
+                oup = flash_attn_varlen_kvpacked_func(
+                    q=q_compact.to(dtype=torch.bfloat16), 
+                    kv=kv_compact.to(dtype=torch.bfloat16), 
+                    cu_seqlens_q=cu_seqlens_q, 
+                    cu_seqlens_k=cu_seqlens_k, 
+                    max_seqlen_q=Lq, 
+                    max_seqlen_k=max_seqlen_k, 
+                    dropout_p=0, 
+                    softmax_scale=self.scale
+                ).reshape(B, Lq, -1)
+                oup = oup.float()
+            else:
+                oup = flash_attn_varlen_kvpacked_func(q=q_compact, kv=kv_compact, cu_seqlens_q=cu_seqlens_q, cu_seqlens_k=cu_seqlens_k, max_seqlen_q=Lq, max_seqlen_k=max_seqlen_k, dropout_p=0, softmax_scale=self.scale).reshape(B, Lq, -1)
+
+        else:
+            if q_compact.dtype == torch.float32:    # todo: fp16 or bf16?
+                oup = flash_attn_varlen_kvpacked_func(q=q_compact.to(dtype=torch.bfloat16), kv=kv_compact.to(dtype=torch.bfloat16), cu_seqlens_q=cu_seqlens_q, cu_seqlens_k=cu_seqlens_k, max_seqlen_q=Lq, max_seqlen_k=max_seqlen_k, dropout_p=0, softmax_scale=self.scale).reshape(B, Lq, -1)
+                oup = oup.float()
+            else:
+                oup = flash_attn_varlen_kvpacked_func(q=q_compact, kv=kv_compact, cu_seqlens_q=cu_seqlens_q, cu_seqlens_k=cu_seqlens_k, max_seqlen_q=Lq, max_seqlen_k=max_seqlen_k, dropout_p=0, softmax_scale=self.scale).reshape(B, Lq, -1)
+            
         return self.proj_drop(self.proj(oup))
     
     def extra_repr(self) -> str:
         return f'Cq={self.embed_dim}, Ckv={self.kv_dim}, cos_attn={self.cos_attn}'
+
+class SparseCrossAttention(nn.Module):
+    def __init__(
+        self, for_attn_pool=False, embed_dim=768, kv_dim=4096, num_heads=12,
+        proj_drop=0., cos_attn=False, sparsity_ratio=0.25
+    ):
+        cos_attn = False    # TODO: never use cos attn in cross attention with T5 kv
+        super().__init__()
+        self.for_attn_pool = for_attn_pool
+        self.embed_dim = embed_dim
+        self.kv_dim = kv_dim
+        assert embed_dim % num_heads == 0
+        self.num_heads, self.head_dim = num_heads, embed_dim // num_heads
+        self.cos_attn = cos_attn
+        self.sparsity_ratio = sparsity_ratio
+        
+        if self.cos_attn:
+            self.scale = 1
+            self.scale_mul_1H1 = nn.Parameter(torch.full(size=(1, self.num_heads, 1, 1), fill_value=4.0).log(), requires_grad=True)
+            self.max_scale_mul = torch.log(torch.tensor(100)).item()
+        else:
+            self.scale = 1 / math.sqrt(self.head_dim)
+        
+        if for_attn_pool:
+            q = torch.empty(1, self.num_heads, self.head_dim)
+            nn.init.trunc_normal_(q, mean=0, std=math.sqrt(1 / embed_dim / 3))
+            self.mat_q = nn.Parameter(q)
+        else:
+            self.mat_q = nn.Linear(embed_dim, embed_dim, bias=True)
+        self.mat_kv = nn.Linear(kv_dim, embed_dim*2, bias=False)
+        self.v_bias = nn.Parameter(torch.zeros(embed_dim))
+        self.register_buffer('zero_k_bias', torch.zeros(embed_dim))
+        
+        self.proj = nn.Linear(embed_dim, embed_dim)
+        self.proj_drop = get_dropout_layer(proj_drop)
+        
+        # 用于存储attention map
+        self.return_attention = False
+        self.attention_weights = None
+        self.attention_hooks = []
+        self.sparsity_mask = None
+    
+    def set_return_attention(self, return_attention=True):
+        self.return_attention = return_attention
+    
+    def _attention_hook(self, module, input, output):
+        if self.return_attention and hasattr(module, 'attention_weights'):
+            self.attention_weights = module.attention_weights.detach().cpu()
+    
+    def register_attention_hook(self):
+        if self.return_attention:
+            for hook in self.attention_hooks:
+                hook.remove()
+            self.attention_hooks = []
+            hook = self.register_forward_hook(self._attention_hook)
+            self.attention_hooks.append(hook)
+    
+    def _apply_sparsity_to_attention(self, attention_weights, sparsity_ratio=0.25):
+        """
+        对attention weights应用稀疏性，将最小的sparsity_ratio比例的值设为0
+        """
+        if sparsity_ratio <= 0:
+            return attention_weights
+        
+        # attention_weights形状: (batch_size, num_heads, seq_len_q, seq_len_k)
+        batch_size, num_heads, seq_len_q, seq_len_k = attention_weights.shape
+        
+        # 创建mask张量，初始为全True（保留所有位置）
+        mask = torch.zeros_like(attention_weights, dtype=torch.bool)
+        
+        # 重塑为2D以便处理
+        attn_flat = attention_weights.reshape(batch_size * num_heads * seq_len_q, seq_len_k)
+        
+        # 对每一行计算阈值（每行独立的稀疏性）
+        k = max(1, int(seq_len_k * (1 - sparsity_ratio)))  # 要保留的最小值的数量
+        if k >= seq_len_k:  # 如果稀疏比例太小，不进行稀疏化
+            return attention_weights
+        
+        # 找到每行第k大的值作为阈值
+        values, indices = torch.topk(attn_flat, k, dim=-1, largest=True)
+        thresholds = values[:, -1:]  # 每行的阈值
+        
+        # 创建mask：小于等于阈值的位置设为1
+        mask = attn_flat < thresholds
+        attn_sparse = attn_flat.masked_fill(mask, 0.0)
+        
+        # 重新归一化，使得每行和为1
+        row_sums = attn_sparse.sum(dim=-1, keepdim=True)
+        # 避免除零，将零和替换为1
+        row_sums = torch.where(row_sums == 0, torch.ones_like(row_sums), row_sums)
+        attn_sparse = attn_sparse / row_sums
+        
+        # 恢复原始形状
+        attn_sparse = attn_sparse.reshape(batch_size, num_heads, seq_len_q, seq_len_k)
+        mask = mask.reshape(batch_size, num_heads, seq_len_q, seq_len_k)
+        
+        return attn_sparse,mask
+    
+    def _sparse_attention_forward(self, q, k, v, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k):
+        """
+        实现稀疏attention的前向传播
+        """
+        B = len(cu_seqlens_q) - 1  # batch size
+        outputs = []
+        all_attention_weights = []
+        sparsity_masks = []
+        
+        for i in range(B):
+            start_q = cu_seqlens_q[i]
+            end_q = cu_seqlens_q[i+1]
+            start_k = cu_seqlens_k[i]
+            end_k = cu_seqlens_k[i+1]
+            
+            q_i = q[start_q:end_q]  # (Lq_i, num_heads, head_dim)
+            k_i = k[start_k:end_k]  # (Lk_i, num_heads, head_dim)
+            v_i = v[start_k:end_k]  # (Lk_i, num_heads, head_dim)
+            
+            Lq_i = q_i.shape[0]
+            Lk_i = k_i.shape[0]
+            
+            # 重新排列维度: (Lq_i, num_heads, head_dim) -> (num_heads, Lq_i, head_dim)
+            q_i = q_i.transpose(0, 1)  # (num_heads, Lq_i, head_dim)
+            k_i = k_i.transpose(0, 1)  # (num_heads, Lk_i, head_dim)
+            v_i = v_i.transpose(0, 1)  # (num_heads, Lk_i, head_dim)
+            
+            # 计算attention scores
+            attn_scores = torch.matmul(q_i, k_i.transpose(-2, -1)) * self.scale  # (num_heads, Lq_i, Lk_i)
+            
+            # 应用softmax得到attention weights
+            attn_weights = F.softmax(attn_scores, dim=-1)  # (num_heads, Lq_i, Lk_i)
+            
+            # 应用稀疏性
+            attn_weights_sparse, sparsity_mask = self._apply_sparsity_to_attention(
+                attn_weights.unsqueeze(0), self.sparsity_ratio
+            )
+            attn_weights_sparse=attn_weights_sparse.squeeze(0)
+            sparsity_mask = sparsity_mask.squeeze(0)
+            
+            # 计算输出
+            output_i = torch.matmul(attn_weights_sparse, v_i)  # (num_heads, Lq_i, head_dim)
+            output_i = output_i.transpose(0, 1)  # (Lq_i, num_heads, head_dim)
+            
+            outputs.append(output_i)
+            all_attention_weights.append(attn_weights_sparse)
+            sparsity_masks.append(sparsity_mask)
+        
+        # 拼接所有batch的输出
+        oup = torch.cat(outputs, dim=0)
+        
+        # 保存sparsity mask（只保存第一个batch的作为示例）
+        if sparsity_masks:
+            self.sparsity_mask = sparsity_masks[0].detach().cpu()
+        # 存储attention weights（第一个batch）
+        if self.return_attention and all_attention_weights:
+            self.attention_weights = all_attention_weights[0].detach().cpu()
+        
+        return oup
+    
+    def forward(self, q, ca_kv, return_attention=False):
+        """
+        替换flash attention的稀疏attention实现
+        """
+        kv_compact, cu_seqlens_k, max_seqlen_k = ca_kv
+        N = kv_compact.shape[0]
+        
+        # 计算K和V
+        kv_compact = F.linear(kv_compact, weight=self.mat_kv.weight, 
+                             bias=torch.cat((self.zero_k_bias, self.v_bias))).view(N, 2, self.num_heads, self.head_dim)
+        
+        if not self.for_attn_pool:
+            B, Lq = q.shape[:2]
+            q_compact = self.mat_q(q).view(-1, self.num_heads, self.head_dim)
+        else:
+            B = cu_seqlens_k.shape[0] - 1
+            Lq = 1
+            q_compact = self.mat_q.repeat(B, 1, 1).to(dtype=kv_compact.dtype)
+        
+        if self.cos_attn:
+            scale_mul = self.scale_mul_1H1.clamp_max(self.max_scale_mul).exp()
+            k, v = kv_compact.unbind(dim=1)
+            q_compact = F.normalize(q_compact, dim=-1).mul(scale_mul)
+            k = F.normalize(k, dim=-1)
+            kv_compact = torch.stack((k, v), dim=1)
+        
+        q_compact = q_compact.contiguous()
+        kv_compact = kv_compact.contiguous()
+        
+        cu_seqlens_q = torch.arange(0, Lq * (B+1), Lq, dtype=torch.int32, device=q_compact.device)
+        
+        # 分离K和V
+        k_compact, v_compact = kv_compact.unbind(dim=1)  # (N, num_heads, head_dim)
+        
+        # 使用稀疏attention替代flash attention
+        oup = self._sparse_attention_forward(
+            q_compact, k_compact, v_compact, 
+            cu_seqlens_q, cu_seqlens_k, Lq, max_seqlen_k
+        ).reshape(B, Lq, -1)
+        
+        return self.proj_drop(self.proj(oup))
+    
+    def extra_repr(self) -> str:
+        return f'Cq={self.embed_dim}, Ckv={self.kv_dim}, cos_attn={self.cos_attn}, sparsity_ratio={self.sparsity_ratio}'
+    
+    def get_sparsity_mask(self):
+        """获取当前attention层的稀疏mask"""
+        return getattr(self, 'sparsity_mask', None)
 
 
 class SelfAttnBlock(nn.Module):
     def __init__(
         self, embed_dim, kv_dim, cross_attn_layer_scale, cond_dim, act: bool, shared_aln: bool, norm_layer: partial,
         num_heads, mlp_ratio=4., drop=0., drop_path=0., tau=1, cos_attn=False,
-        swiglu=False, customized_flash_attn=False, fused_mlp=False, fused_norm_func=None, checkpointing_sa_only=False,
+        swiglu=False, customized_flash_attn=False, fused_mlp=False, fused_norm_func=None, checkpointing_sa_only=False,sparsity_ratio=None
     ):
         super(SelfAttnBlock, self).__init__()
         self.C, self.D = embed_dim, cond_dim
         self.drop_path_rate = drop_path
         self.drop_path = DropPath(drop_path) if drop_path > 0. else nn.Identity()
-        self.attn = SelfAttention(
+        self.attn = SparseSelfAttention(
+            embed_dim=embed_dim, num_heads=num_heads, proj_drop=drop, tau=tau, cos_attn=cos_attn, customized_flash_attn=customized_flash_attn, attn_fn = attn_fn, sparsity_ratio=sparsity_ratio
+        ) if sparsity_ratio else SelfAttention(
             embed_dim=embed_dim, num_heads=num_heads, proj_drop=drop, tau=tau, cos_attn=cos_attn, customized_flash_attn=customized_flash_attn, attn_fn = attn_fn
         )
         self.using_swiglu = swiglu
@@ -430,10 +968,23 @@ class SelfAttnBlock(nn.Module):
         else:
             lin = nn.Linear(cond_dim, 6*embed_dim)
             self.ada_lin = nn.Sequential(nn.SiLU(inplace=False), lin) if act else nn.Sequential(lin)
+            
+        # 新增：attention map收集
+        self.attention_maps = {}
+    
+    def set_return_attention(self, return_attention=True):
+        """设置是否返回attention map"""
+        self.attn.set_return_attention(return_attention)
+        if return_attention:
+            self.attn.register_attention_hook()
+            
+    def get_attention_map(self):
+        """获取当前block的attention map"""
+        return self.attention_maps
         
     # NOTE: attn_bias_or_two_vector is None during inference
     def forward(self, x, cond_BD, ca_kv, attn_bias_or_two_vector):  # todo: minGPT and vqgan also uses pre-norm, just like this, while MaskGiT uses post-norm
-        with torch.cuda.amp.autocast(enabled=False):
+        with torch.amp.autocast('cuda',enabled=False):
             if self.shared_aln: # always True;                   (1, 1, 6, C)  + (B, 1, 6, C)
                 gamma1, gamma2, scale1, scale2, shift1, shift2 = (self.ada_gss + cond_BD).unbind(2) # 116C + B16C =unbind(2)=> 6 B1C
             else:
@@ -445,6 +996,11 @@ class SelfAttnBlock(nn.Module):
         else:
             x = x + self.drop_path(self.attn(self.fused_ada_norm(C=self.C, eps=self.norm_eps, x=x, scale=scale1, shift=shift1), attn_bias_or_two_vector=attn_bias_or_two_vector).mul_(gamma1))
             x = x + self.drop_path(self.ffn(self.fused_ada_norm(C=self.C, eps=self.norm_eps, x=x, scale=scale2, shift=shift2)).mul(gamma2)) # this mul(gamma2) cannot be in-placed cuz we possibly use FusedMLP
+        
+        # 在forward之后保存attention map（如果存在）
+        if hasattr(self.attn, 'attention_weights') and self.attn.attention_weights is not None:
+            self.attention_maps['self_attention'] = self.attn.attention_weights
+            
         return x
     
     def extra_repr(self) -> str:
@@ -458,16 +1014,24 @@ class CrossAttnBlock(nn.Module):
         num_heads, mlp_ratio=4., drop=0., drop_path=0., tau=1, cos_attn=False,
         swiglu=False, customized_flash_attn=False, fused_mlp=False, fused_norm_func=None, checkpointing_sa_only=False,
         use_flex_attn=False, batch_size=2, pad_to_multiplier=1, apply_rope2d=False, rope2d_normalized_by_hw=False,
+        sparsity_ratio_sa=None,sparsity_ratio_ca=None
     ):
         super(CrossAttnBlock, self).__init__()
         self.C, self.D = embed_dim, cond_dim
         self.drop_path_rate = drop_path
         self.drop_path = DropPath(drop_path) if drop_path > 0. else nn.Identity()
-        self.sa = SelfAttention(
+        self.sa = SparseSelfAttention(
+            embed_dim=embed_dim, num_heads=num_heads, proj_drop=drop, tau=tau, cos_attn=cos_attn, customized_flash_attn=customized_flash_attn,
+            use_flex_attn=use_flex_attn, batch_size=batch_size, pad_to_multiplier=pad_to_multiplier, rope2d_normalized_by_hw=rope2d_normalized_by_hw,sparsity_ratio=sparsity_ratio_sa
+        ) if sparsity_ratio_sa else SelfAttention(
             embed_dim=embed_dim, num_heads=num_heads, proj_drop=drop, tau=tau, cos_attn=cos_attn, customized_flash_attn=customized_flash_attn,
             use_flex_attn=use_flex_attn, batch_size=batch_size, pad_to_multiplier=pad_to_multiplier, rope2d_normalized_by_hw=rope2d_normalized_by_hw,
         )
-        self.ca = CrossAttention(embed_dim=embed_dim, kv_dim=kv_dim, num_heads=num_heads, proj_drop=drop, cos_attn=cos_attn)
+        self.ca = SparseCrossAttention(
+            embed_dim=embed_dim, kv_dim=kv_dim, num_heads=num_heads, proj_drop=drop, cos_attn=cos_attn, sparsity_ratio=sparsity_ratio_ca
+        ) if sparsity_ratio_ca else CrossAttention(
+            embed_dim=embed_dim, kv_dim=kv_dim, num_heads=num_heads, proj_drop=drop, cos_attn=cos_attn
+        ) 
         self.using_swiglu = swiglu
         self.ffn = (FFNSwiGLU if swiglu else FFN)(in_features=embed_dim, hidden_features=round(embed_dim * mlp_ratio / 256) * 256, drop=drop, fused_mlp=fused_mlp)
         
@@ -489,10 +1053,25 @@ class CrossAttnBlock(nn.Module):
             self.ca_gamma = 1
         
         self.checkpointing_sa_only = checkpointing_sa_only
+        
+        # 新增：attention map收集
+        self.attention_maps = {}
+    
+    def set_return_attention(self, return_attention=True):
+        """设置是否返回attention map"""
+        self.sa.set_return_attention(return_attention)
+        self.ca.set_return_attention(return_attention)
+        if return_attention:
+            self.sa.register_attention_hook()
+            self.ca.register_attention_hook()
+    
+    def get_attention_map(self):
+        """获取当前block的attention map"""
+        return self.attention_maps
     
     # NOTE: attn_bias_or_two_vector is None during inference
     def forward(self, x, cond_BD, ca_kv, attn_bias_or_two_vector, attn_fn=None, scale_schedule=None, rope2d_freqs_grid=None, scale_ind=0):    # todo: minGPT and vqgan also uses pre-norm, just like this, while MaskGiT uses post-norm
-        with torch.cuda.amp.autocast(enabled=False):    # disable half precision
+        with torch.amp.autocast('cuda',enabled=False):    # disable half precision
             if self.shared_aln: # always True;                   (1, 1, 6, C)  + (B, 1, 6, C)
                 gamma1, gamma2, scale1, scale2, shift1, shift2 = (self.ada_gss + cond_BD).unbind(2) # 116C + B16C =unbind(2)=> 6 B1C
             else:
@@ -516,6 +1095,13 @@ class CrossAttnBlock(nn.Module):
             x = x + self.drop_path(x_sa.mul_(gamma1))
             x = x + self.ca(self.ca_norm(x), ca_kv).float().mul_(self.ca_gamma)
             x = x + self.drop_path(self.ffn(self.fused_norm_func(C=self.C, eps=self.norm_eps, x=x, scale=scale2, shift=shift2)).mul(gamma2)) # this mul(gamma2) cannot be in-placed cuz we possibly use FusedMLP
+        
+        # 在forward之后保存attention map（如果存在）
+        if hasattr(self.sa, 'attention_weights') and self.sa.attention_weights is not None:
+            self.attention_maps['self_attention'] = self.sa.attention_weights
+        if hasattr(self.ca, 'attention_weights') and self.ca.attention_weights is not None:
+            self.attention_maps['cross_attention'] = self.ca.attention_weights
+        
         return x
     
     def extra_repr(self) -> str:
@@ -556,20 +1142,15 @@ def main():
     for i, x in enumerate(Li):
         attn_bias[i, 0, :, x:] = -torch.inf
     
-    q = torch.randn(B, Lq, H, cq, generator=rng, device=dev)
-    k = torch.randn(B, L, H, ckv, generator=rng, device=dev)
-    v = torch.randn(B, L, H, ckv, generator=rng, device=dev)
-    tq, tk, tv = q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2)    # BHLc
-    
-    seqlen_k = torch.tensor(Li, dtype=torch.int32, device=dev)
-    cu_seqlens_k = F.pad(torch.cumsum(seqlen_k, dim=0, dtype=torch.torch.int32), (1, 0))
-    kv = torch.stack([k, v], dim=2)
-    kv_compact = torch.cat([kv[i, :Li[i]] for i in range(B)], dim=0)
-    
+    q = torch.randn(B, Lq, Cq, generator=rng, device=dev)
+    kv_base = torch.randn(B, L, Ckv, generator=rng, device=dev)
+    # 打包成 varlen 的 2D kv_compact：(sum(lens), Ckv)
+    kv_compact = torch.cat([kv_base[i, :Li[i]] for i in range(B)], dim=0)
+    seqlen_k     = torch.tensor(Li, dtype=torch.int32, device=dev)
+    cu_seqlens_k = F.pad(torch.cumsum(seqlen_k, dim=0, dtype=torch.int32), (1, 0))  # (B+1,)
     ca = CrossAttention(for_attn_pool=False, embed_dim=Cq, kv_dim=Ckv, num_heads=H)
-    CrossAttention.forward
-    ca(q, (kv_compact, cu_seqlens_k, max(Li))).mean().backward()
-
-
+    out = ca(q, (kv_compact, cu_seqlens_k, max(Li)))  # (B, Lq, Cq)
+    out.mean().backward()
+    
 if __name__ == '__main__':
     main()

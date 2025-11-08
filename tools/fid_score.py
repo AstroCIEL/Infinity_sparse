@@ -48,12 +48,16 @@ except ImportError:
     # If tqdm is not available, provide a mock version of it
     def tqdm(x):
         return x
-
+from pytorch_fid.inception import InceptionV3
 # from pytorch_fid.inception import InceptionV3
 
 parser = ArgumentParser(formatter_class=ArgumentDefaultsHelpFormatter)
 parser.add_argument('--batch-size', type=int, default=50,
                     help='Batch size to use')
+parser.add_argument('--dims', type=int, default=2048,
+                    choices=list(InceptionV3.BLOCK_INDEX_BY_DIM),
+                    help=('Dimensionality of Inception features to use. '
+                          'By default, uses pool3 features'))
 parser.add_argument('--max_samples', type=int, default=9999999999,
                     help='max data samples')
 parser.add_argument('--num-workers', type=int,

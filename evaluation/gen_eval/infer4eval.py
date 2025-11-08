@@ -28,7 +28,7 @@ os.environ['XFORMERS_FORCE_DISABLE_TRITON'] = '1'
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
     add_common_arguments(parser)
-    parser.add_argument('--outdir', type=str, default='')
+    parser.add_argument('--outdir', type=str, default='/DISK1/home/yx_zhao31/Infinity/output')
     parser.add_argument('--n_samples', type=int, default=4)
     parser.add_argument('--metadata_file', type=str, default='evaluation/gen_eval/prompts/evaluation_metadata.jsonl')
     parser.add_argument('--rewrite_prompt', type=int, default=0, choices=[0,1])

@@ -19,12 +19,17 @@ from transformers import AutoTokenizer, T5EncoderModel, T5TokenizerFast
 from PIL import Image, ImageEnhance
 import torch.nn.functional as F
 from torch.cuda.amp import autocast
+import sys, os
+sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from infinity.models.infinity import Infinity
 from infinity.models.basic import *
 import PIL.Image as PImage
 from torchvision.transforms.functional import to_tensor
 from infinity.utils.dynamic_resolution import dynamic_resolution_h_w, h_div_w_templates
+
+import matplotlib.pyplot as plt
+import seaborn as sns
 
 
 def extract_key_val(text):
@@ -74,6 +79,191 @@ def enhance_image(image):
         color_image = color_enhancer.enhance(1.05)  # 增强饱和度
     return color_image
 
+def gen_one_img_with_power(
+    infinity_test,
+    vae,
+    text_tokenizer,
+    text_encoder,
+    prompt,
+    csv_path,                # << 必填：功耗结果输出 CSV 文件
+    cfg_list=[],
+    tau_list=[],
+    negative_prompt='',
+    scale_schedule=None,
+    top_k=900,
+    top_p=0.97,
+    cfg_sc=3,
+    cfg_exp_k=0.0,
+    cfg_insertion_layer=-5,
+    vae_type=0,
+    gumbel=0,
+    softmax_merge_topk=-1,
+    gt_leak=-1,
+    gt_ls_Bl=None,
+    g_seed=None,
+    sampling_per_bits=1,
+    enable_positive_prompt=0,
+    power_hz=200.0,          # 采样频率（可调：100~500）
+    device_index=0,          # NVML 里的 GPU 索引；单卡映射时一般就是 0
+):
+    """
+    只测功耗，不测时间、不写 Excel、不保存图片。
+    会在 csv_path 写入列：stage, block, attn_J, ffn_J, other_J, total_J, seq_len
+    """
+    # 组 cfg/tau
+    if not isinstance(cfg_list, list):
+        cfg_list = [cfg_list] * len(scale_schedule)
+    if not isinstance(tau_list, list):
+        tau_list = [tau_list] * len(scale_schedule)
+
+    # 文本编码，拿到 label_B_or_BLT
+    text_cond_tuple = encode_prompt(text_tokenizer, text_encoder, prompt, enable_positive_prompt)
+    if negative_prompt:
+        negative_label_B_or_BLT = encode_prompt(text_tokenizer, text_encoder, negative_prompt)
+    else:
+        negative_label_B_or_BLT = None
+
+    # 直接调用 Infinity.infer_cfg3_power（你已在 Infinity 里按我上一条加过它）
+    infinity_test.infer_cfg3_power(
+        csv_path=csv_path,
+        vae=vae,
+        scale_schedule=scale_schedule,
+        label_B_or_BLT=text_cond_tuple,
+        B=1,
+        negative_label_B_or_BLT=negative_label_B_or_BLT,
+        g_seed=g_seed,
+        cfg_sc=cfg_sc,
+        cfg_list=cfg_list,
+        tau_list=tau_list,
+        top_k=top_k,
+        top_p=top_p,
+        returns_vemb=1,              # 只测能量，不用返回图像向量
+        gumbel=gumbel,
+        norm_cfg=False,
+        cfg_exp_k=cfg_exp_k,
+        cfg_insertion_layer=cfg_insertion_layer,
+        vae_type=vae_type,
+        softmax_merge_topk=softmax_merge_topk,
+        ret_img=False,               # 不返图
+        trunk_scale=1000,
+        gt_leak=gt_leak,
+        gt_ls_Bl=gt_ls_Bl,
+        inference_mode=True,
+        sampling_per_bits=sampling_per_bits,
+        power_hz=power_hz,
+        device_index=device_index,
+    )
+    print(f"[power] Wrote per-stage×block energy CSV: {csv_path}")
+
+
+def gen_one_img_with_time(
+    infinity_test, 
+    vae, 
+    text_tokenizer,
+    text_encoder,
+    prompt, 
+    excel_path,                 # <<< 新增：Excel 输出路径，如 "/path/to/profiling.xlsx"
+    cfg_list=[],
+    tau_list=[],
+    negative_prompt='',
+    scale_schedule=None,
+    top_k=900,
+    top_p=0.97,
+    cfg_sc=3,
+    cfg_exp_k=0.0,
+    cfg_insertion_layer=-5,
+    vae_type=0,
+    gumbel=0,
+    softmax_merge_topk=-1,
+    gt_leak=-1,
+    gt_ls_Bl=None,
+    g_seed=None,
+    sampling_per_bits=1,
+    enable_positive_prompt=0,
+):
+    os.makedirs(os.path.dirname(excel_path), exist_ok=True)  # 确保目录存在
+
+    sstt = time.time()
+    if not isinstance(cfg_list, list):
+        cfg_list = [cfg_list] * len(scale_schedule)
+    if not isinstance(tau_list, list):
+        tau_list = [tau_list] * len(scale_schedule)
+
+    text_cond_tuple = encode_prompt(text_tokenizer, text_encoder, prompt, enable_positive_prompt)
+    if negative_prompt:
+        negative_label_B_or_BLT = encode_prompt(text_tokenizer, text_encoder, negative_prompt)
+    else:
+        negative_label_B_or_BLT = None
+
+    print(f'cfg: {cfg_list}, tau: {tau_list}')
+    with torch.amp.autocast('cuda',enabled=True, dtype=torch.bfloat16, cache_enabled=True):
+        stt = time.time()
+        # 关键改动：调用 infer_cfg2，并把 excel_path 传进去
+        _, _, img_list = infinity_test.infer_cfg2(
+            excel_path=excel_path,
+            vae=vae,
+            scale_schedule=scale_schedule,
+            label_B_or_BLT=text_cond_tuple, g_seed=g_seed,
+            B=1, negative_label_B_or_BLT=negative_label_B_or_BLT, force_gt_Bhw=None,
+            cfg_sc=cfg_sc, cfg_list=cfg_list, tau_list=tau_list, top_k=top_k, top_p=top_p,
+            returns_vemb=1, ratio_Bl1=None, gumbel=gumbel, norm_cfg=False,
+            cfg_exp_k=cfg_exp_k, cfg_insertion_layer=cfg_insertion_layer,
+            vae_type=vae_type, softmax_merge_topk=softmax_merge_topk,
+            ret_img=True, trunk_scale=1000,
+            gt_leak=gt_leak, gt_ls_Bl=gt_ls_Bl, inference_mode=True,
+            sampling_per_bits=sampling_per_bits,
+        )
+    print(f"cost: {time.time() - sstt:.3f}s, infinity cost={time.time() - stt:.3f}s")
+    img = img_list[0]
+    return img
+
+def analyze_attention_maps(attention_data, save_path=None):
+    """分析收集到的attention map数据"""
+    
+    if save_path:
+        # 确保保存路径存在，如果不存在则创建
+        # exist_ok=True 避免目录已存在时抛出错误
+        os.makedirs(save_path, exist_ok=True)
+        print(f"Save directory created/checked: {save_path}")
+    
+    analysis_results = {}
+    
+    for stage_key, stage_data in attention_data.items():
+        print(f"Analyzing {stage_key}...")
+            
+        for attn_type, attn_map in stage_data.items():
+            if attn_map is not None:
+                # 基础统计分析
+                analysis = {
+                    'shape': attn_map.shape,
+                    'mean': attn_map.mean().item(),
+                    'std': attn_map.std().item(),
+                    'max': attn_map.max().item(),
+                    'min': attn_map.min().item(),
+                }
+                
+                analysis_results[f"{stage_key}_{attn_type}"] = analysis
+                
+                # 可视化（可选）
+                if save_path:   
+                    if attn_map.dim() == 4:# B, H, L, L
+                    # 取第一个batch和第一个head的可视化
+                        sample_attn = attn_map[0, 0].numpy()
+                    elif attn_map.dim() == 3: # H, L, L
+                    # 取第一个head的可视化
+                        sample_attn = attn_map[0].numpy()
+                        
+                    ratio=len(sample_attn)/len(sample_attn[0]) #y/x
+                    
+                    plt.figure(figsize=(10, 8*ratio))
+                    sns.heatmap(sample_attn, cmap='Blues', 
+                               xticklabels=False, yticklabels=False)
+                    plt.title(f'{stage_key}_{attn_type}')
+                    plt.savefig(f'{save_path}/{stage_key}_{attn_type}.png')
+                    plt.close()
+    
+    return analysis_results
+
 def gen_one_img(
     infinity_test, 
     vae, 
@@ -97,6 +287,8 @@ def gen_one_img(
     g_seed=None,
     sampling_per_bits=1,
     enable_positive_prompt=0,
+    save_sparsity_masks=False,  # 新增参数
+    sparsity_mask_save_path=None,  # 新增参数
 ):
     sstt = time.time()
     if not isinstance(cfg_list, list):
@@ -109,7 +301,7 @@ def gen_one_img(
     else:
         negative_label_B_or_BLT = None
     print(f'cfg: {cfg_list}, tau: {tau_list}')
-    with torch.cuda.amp.autocast(enabled=True, dtype=torch.bfloat16, cache_enabled=True):
+    with torch.amp.autocast('cuda',enabled=True, dtype=torch.bfloat16, cache_enabled=True):
         stt = time.time()
         _, _, img_list = infinity_test.autoregressive_infer_cfg(
             vae=vae,
@@ -122,11 +314,74 @@ def gen_one_img(
             vae_type=vae_type, softmax_merge_topk=softmax_merge_topk,
             ret_img=True, trunk_scale=1000,
             gt_leak=gt_leak, gt_ls_Bl=gt_ls_Bl, inference_mode=True,
-            sampling_per_bits=sampling_per_bits,
+            sampling_per_bits=sampling_per_bits, save_sparsity_masks=save_sparsity_masks, 
+            sparsity_mask_save_path=sparsity_mask_save_path
         )
     print(f"cost: {time.time() - sstt}, infinity cost={time.time() - stt}")
     img = img_list[0]
     return img
+
+
+def gen_one_img_with_attnmap(
+    infinity_test, 
+    vae, 
+    text_tokenizer,
+    text_encoder,
+    prompt, 
+    cfg_list=[],
+    tau_list=[],
+    negative_prompt='',
+    scale_schedule=None,
+    top_k=900,
+    top_p=0.97,
+    cfg_sc=3,
+    cfg_exp_k=0.0,
+    cfg_insertion_layer=-5,
+    vae_type=0,
+    gumbel=0,
+    softmax_merge_topk=-1,
+    gt_leak=-1,
+    gt_ls_Bl=None,
+    g_seed=None,
+    sampling_per_bits=1,
+    enable_positive_prompt=0,
+    attention_stages=[1, 2, 3, 4, 5],
+    save_path='./attention_analysis',
+):
+    sstt = time.time()
+    if not isinstance(cfg_list, list):
+        cfg_list = [cfg_list] * len(scale_schedule)
+    if not isinstance(tau_list, list):
+        tau_list = [tau_list] * len(scale_schedule)
+    text_cond_tuple = encode_prompt(text_tokenizer, text_encoder, prompt, enable_positive_prompt)
+    if negative_prompt:
+        negative_label_B_or_BLT = encode_prompt(text_tokenizer, text_encoder, negative_prompt)
+    else:
+        negative_label_B_or_BLT = None
+    print(f'cfg: {cfg_list}, tau: {tau_list}')
+    with torch.amp.autocast('cuda',enabled=True, dtype=torch.bfloat16, cache_enabled=True):
+        stt = time.time()
+        _, _, img_list, attn_maps = infinity_test.autoregressive_infer_cfg(
+            vae=vae,
+            scale_schedule=scale_schedule,
+            label_B_or_BLT=text_cond_tuple, g_seed=g_seed,
+            B=1, negative_label_B_or_BLT=negative_label_B_or_BLT, force_gt_Bhw=None,
+            cfg_sc=cfg_sc, cfg_list=cfg_list, tau_list=tau_list, top_k=top_k, top_p=top_p,
+            returns_vemb=1, ratio_Bl1=None, gumbel=gumbel, norm_cfg=False,
+            cfg_exp_k=cfg_exp_k, cfg_insertion_layer=cfg_insertion_layer,
+            vae_type=vae_type, softmax_merge_topk=softmax_merge_topk,
+            ret_img=True, trunk_scale=1000,
+            gt_leak=gt_leak, gt_ls_Bl=gt_ls_Bl, inference_mode=True,
+            sampling_per_bits=sampling_per_bits,
+            collect_attention_maps=True,  # 新增参数：是否收集attention map
+            attention_stages=attention_stages, 
+        )
+    print(f"cost: {time.time() - sstt}, infinity cost={time.time() - stt}")
+    img = img_list[0]
+    if attn_maps:
+        analysis = analyze_attention_maps(attn_maps, save_path=save_path)
+        print(f"Attention analysis completed and maps saved at {save_path}")
+    return img, analysis
 
 def get_prompt_id(prompt):
     md5 = hashlib.md5()
@@ -173,15 +428,17 @@ def load_infinity(
     use_flex_attn=False,
     bf16=False,
     checkpoint_type='torch',
+    customized_flash_attn=False,
+    sparsity_ratio=None
 ):
     print(f'[Loading Infinity]')
     text_maxlen = 512
-    with torch.cuda.amp.autocast(enabled=True, dtype=torch.bfloat16, cache_enabled=True), torch.no_grad():
+    with torch.amp.autocast('cuda',enabled=True, dtype=torch.bfloat16, cache_enabled=True), torch.no_grad():
         infinity_test: Infinity = Infinity(
             vae_local=vae, text_channels=text_channels, text_maxlen=text_maxlen,
             shared_aln=True, raw_scale_schedule=scale_schedule,
             checkpointing='full-block',
-            customized_flash_attn=False,
+            customized_flash_attn=customized_flash_attn,
             fused_norm=True,
             pad_to_multiplier=128,
             use_flex_attn=use_flex_attn,
@@ -193,6 +450,7 @@ def load_infinity(
             apply_spatial_patchify=apply_spatial_patchify,
             inference_mode=True,
             train_h_div_w_list=[1.0],
+            sparsity_ratio=sparsity_ratio,
             **model_kwargs,
         ).to(device=device)
         print(f'[you selected Infinity with {model_kwargs=}] model size: {sum(p.numel() for p in infinity_test.parameters())/1e9:.2f}B, bf16={bf16}')
@@ -345,6 +603,8 @@ def load_transformer(vae, args):
         use_flex_attn=args.use_flex_attn,
         bf16=args.bf16,
         checkpoint_type=args.checkpoint_type,
+        customized_flash_attn=args.customized_flash_attn,
+        sparsity_ratio=args.sparsity_ratio
     )
     return infinity
 
@@ -374,6 +634,11 @@ def add_common_arguments(parser):
     parser.add_argument('--checkpoint_type', type=str, default='torch')
     parser.add_argument('--seed', type=int, default=0)
     parser.add_argument('--bf16', type=int, default=1, choices=[0,1])
+    parser.add_argument('--customized_flash_attn', type=bool, default=False)
+    parser.add_argument('--sparsity_ratio', type=float, default=None)
+    if not any(opt.option_strings == ['--enable_model_cache'] for opt in parser._actions):
+        parser.add_argument("--enable_model_cache", action="store_true", default=True, help="Enable local model cache.")
+
     
 
 

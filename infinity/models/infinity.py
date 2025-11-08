@@ -1,17 +1,18 @@
 """
 Definition of Infinity transformer model.
 """
-
+import os
 import math
 import random
 import time
 from contextlib import nullcontext
 from functools import partial
 from typing import List, Optional, Tuple, Union, Dict, Any
-
+import pandas as pd 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from measure.power_metering import PowerMeter
 from timm.models import register_model
 from torch.utils.checkpoint import checkpoint
 from PIL import Image
@@ -102,6 +103,8 @@ class Infinity(nn.Module):
         always_training_scales=20,
         apply_spatial_patchify = 0,
         inference_mode=False,
+        sparsity_ratio_sa=None,
+        sparsity_ratio_ca=None,
     ):
         # set hyperparameters
         self.C = embed_dim
@@ -254,12 +257,20 @@ class Infinity(nn.Module):
         dpr = [x.item() for x in torch.linspace(0, drop_path_rate, depth)]  # dpr means drop path rate (linearly increasing)
         self.unregistered_blocks = []
         for block_idx in range(depth):
-            block = (CrossAttnBlock if self.t2i else SelfAttnBlock)(
+            block = CrossAttnBlock (
                 embed_dim=self.C, kv_dim=self.D, cross_attn_layer_scale=cross_attn_layer_scale, cond_dim=self.D, act=True, shared_aln=shared_aln, norm_layer=norm_layer,
                 num_heads=num_heads, mlp_ratio=mlp_ratio, drop=drop_rate, drop_path=dpr[block_idx], tau=tau, cos_attn=cos_attn,
                 swiglu=swiglu, customized_flash_attn=self.customized_flash_attn, fused_mlp=fused_mlp, fused_norm_func=fused_norm_func,
                 checkpointing_sa_only=self.checkpointing == 'self-attn',
                 use_flex_attn=use_flex_attn, batch_size=batch_size, pad_to_multiplier=pad_to_multiplier, rope2d_normalized_by_hw=rope2d_normalized_by_hw,
+                sparsity_ratio_sa=sparsity_ratio_sa, sparsity_ratio_ca=sparsity_ratio_ca
+            ) if self.t2i else SelfAttnBlock(
+                embed_dim=self.C, kv_dim=self.D, cross_attn_layer_scale=cross_attn_layer_scale, cond_dim=self.D, act=True, shared_aln=shared_aln, norm_layer=norm_layer,
+                num_heads=num_heads, mlp_ratio=mlp_ratio, drop=drop_rate, drop_path=dpr[block_idx], tau=tau, cos_attn=cos_attn,
+                swiglu=swiglu, customized_flash_attn=self.customized_flash_attn, fused_mlp=fused_mlp, fused_norm_func=fused_norm_func,
+                checkpointing_sa_only=self.checkpointing == 'self-attn',
+                use_flex_attn=use_flex_attn, batch_size=batch_size, pad_to_multiplier=pad_to_multiplier, rope2d_normalized_by_hw=rope2d_normalized_by_hw,
+                sparsity_ratio=sparsity_ratio_sa
             )
             self.unregistered_blocks.append(block)
         
@@ -288,6 +299,48 @@ class Infinity(nn.Module):
             f'    [drop ratios] drop_rate={drop_rate}, drop_path_rate={drop_path_rate:g} ({torch.linspace(0, drop_path_rate, depth)})',
             end='\n\n', flush=True
         )
+        
+        # 新增：attention map收集相关变量
+        self.attention_collection_enabled = False
+        self.collected_attention_maps = {}
+        self.sparsity_masks = None
+        self.sparsity_ratio_sa=sparsity_ratio_sa
+        self.sparsity_ratio_ca=sparsity_ratio_ca
+
+    
+    def enable_attention_collection(self, enable=True):
+        """启用或禁用attention map收集"""
+        self.attention_collection_enabled = enable
+        
+        # 设置所有block的attention收集状态
+        for block in self.unregistered_blocks:
+            if hasattr(block, 'set_return_attention'):
+                block.set_return_attention(enable)
+                
+    def clear_attention_maps(self):
+        """清空已收集的attention map"""
+        self.collected_attention_maps = {}
+        for block in self.unregistered_blocks:
+            if hasattr(block, 'attention_maps'):
+                block.attention_maps = {}
+    
+    def collect_attention_maps(self, stage_idx, block_idx):
+        """收集指定stage和block的attention map"""
+        if not self.attention_collection_enabled:
+            return
+            
+        key = f"stage_{stage_idx}_block_{block_idx}"
+        self.collected_attention_maps[key] = {}
+        
+        # 收集所有block的attention map
+        for i, block in enumerate(self.unregistered_blocks):
+            if i==block_idx:
+                if hasattr(block, 'attention_maps') and block.attention_maps:
+                    self.collected_attention_maps[key]= block.attention_maps.copy()
+    
+    def get_attention_maps(self):
+        """获取收集到的所有attention map"""
+        return self.collected_attention_maps
     
 
     def compile_flex_attn(self):
@@ -362,6 +415,49 @@ class Infinity(nn.Module):
         x_BLC_list.append(x_BLC[:,ptr:])
         x_BLC = torch.cat(x_BLC_list, dim=1)
         return x_BLC
+    
+    def _save_sparsity_masks(self, save_path):
+        """保存sparsity mask到文件"""
+        import os
+        import pickle
+        import torch
+        
+        os.makedirs(os.path.dirname(save_path), exist_ok=True)
+        
+        # 准备保存的数据结构
+        mask_data = {
+            'masks': {},
+            'metadata': {
+                'total_stages': len([k for k in self.sparsity_masks.keys() if k.startswith('stage')]),
+                'total_blocks': len(self.sparsity_masks),
+                'sparsity_ratio_sa': getattr(self, 'sparsity_ratio_sa', None),
+                'sparsity_ratio_ca': getattr(self, 'sparsity_ratio_ca', None),
+                'save_timestamp': time.time()
+            }
+        }
+        
+        for key, mask_dict in self.sparsity_masks.items():
+            stage_block_data = {}
+            for attn_type, mask_tensor in mask_dict.items():
+                if mask_tensor is not None:
+                    # 保存mask的元数据
+                    stage_block_data[attn_type] = {
+                        'mask': mask_tensor,  # 实际mask张量
+                        'shape': mask_tensor.shape,
+                        'dtype': str(mask_tensor.dtype),
+                        'sparsity_ratio': mask_tensor.float().mean().item() if mask_tensor.numel() > 0 else 0.0 # 1 for sparse
+                    }
+            
+            if stage_block_data:
+                mask_data['masks'][key] = stage_block_data
+        
+        # 保存为pkl文件
+        with open(save_path, 'wb') as f:
+            pickle.dump(mask_data, f)
+        
+        print(f"[INFO] Sparsity masks saved to {save_path}")
+        print(f"       Total stages: {mask_data['metadata']['total_stages']}")
+        print(f"       Total blocks: {mask_data['metadata']['total_blocks']}")
 
     def forward(self, label_B_or_BLT: Union[torch.LongTensor, Tuple[torch.FloatTensor, torch.IntTensor, int]], x_BLC_wo_prefix: torch.Tensor, scale_schedule: List[Tuple[int]],
         cfg_infer=False,
@@ -468,7 +564,19 @@ class Infinity(nn.Module):
         inference_mode=False,
         save_img_path=None,
         sampling_per_bits=1,
+        collect_attention_maps=False,  # 新增参数：是否收集attention map
+        attention_stages=None,         # 新增参数：指定收集哪些stage的attention
+        save_sparsity_masks=False,  # 新增参数：是否保存sparsity mask
+        sparsity_mask_save_path=None,  # 新增参数：sparsity mask保存路径
     ):   # returns List[idx_Bl]
+        
+        if collect_attention_maps:
+            self.enable_attention_collection(True)
+            self.clear_attention_maps()
+            print("[INFO] Attention map collection enabled")
+        if save_sparsity_masks:
+            self.sparsity_masks = {}
+            print("[INFO] Sparsity mask collection enabled")
         if g_seed is None: rng = None
         else: self.rng.manual_seed(g_seed); rng = self.rng
         assert len(cfg_list) >= len(scale_schedule)
@@ -540,6 +648,9 @@ class Infinity(nn.Module):
             if si >= trunk_scale:
                 break
             cur_L += np.array(pn).prod()
+            
+            should_collect_attention = (collect_attention_maps and 
+                                        (attention_stages is None or si in attention_stages))
 
             need_to_pad = 0
             attn_fn = None
@@ -564,7 +675,30 @@ class Infinity(nn.Module):
                         # print(f'add cfg={cfg} on {layer_idx}-th layer output')
                         last_stage = cfg * last_stage[:B] + (1-cfg) * last_stage[B:]
                         last_stage = torch.cat((last_stage, last_stage), 0)
+                    if should_collect_attention:
+                        self.collect_attention_maps(si, layer_idx)
+                    # 收集sparsity mask
+                    if save_sparsity_masks:
+                        sparsity_mask_data = {}
+                        
+                        # 检查self attention
+                        if hasattr(m, 'sa') and hasattr(m.sa, 'get_sparsity_mask'):
+                            sa_mask = m.sa.get_sparsity_mask()
+                            if sa_mask is not None:
+                                sparsity_mask_data['self_attention'] = sa_mask
+                        
+                        # 检查cross attention（如果是CrossAttnBlock）
+                        if hasattr(m, 'ca') and hasattr(m.ca, 'get_sparsity_mask'):
+                            ca_mask = m.ca.get_sparsity_mask()
+                            if ca_mask is not None:
+                                sparsity_mask_data['cross_attention'] = ca_mask
+                        
+                        # 保存到全局字典
+                        if sparsity_mask_data:
+                            key = f"stage_{si}_block_{layer_idx}"
+                            self.sparsity_masks[key] = sparsity_mask_data
                     layer_idx += 1
+                    
             
             if (cfg != 1) and add_cfg_on_logits:
                 # print(f'add cfg on add_cfg_on_logits')
@@ -628,6 +762,339 @@ class Infinity(nn.Module):
             for block_chunk_ in self.block_chunks:
                 for module in block_chunk_.module.module:
                     (module.sa if isinstance(module, CrossAttnBlock) else module.attn).kv_caching(False)
+                    
+        # 在函数返回前处理attention map数据
+        attention_results = None
+        if collect_attention_maps:
+            attention_results = self.get_attention_maps()
+            self.enable_attention_collection(False)  # 禁用收集
+            print(f"[INFO] Collected attention maps for {len(attention_results)} stages")
+            
+            # 保存sparsity mask到文件
+        if save_sparsity_masks and self.sparsity_masks and sparsity_mask_save_path:
+            self._save_sparsity_masks(sparsity_mask_save_path)
+
+        if not ret_img:
+            if collect_attention_maps:
+                return ret, idx_Bl_list, [], attention_results
+            else:
+                return ret, idx_Bl_list, []
+        
+        if vae_type != 0:
+            img = vae.decode(summed_codes.squeeze(-3))
+        else:
+            img = vae.viz_from_ms_h_BChw(ret, scale_schedule=scale_schedule, same_shape=True, last_one=True)
+
+        img = (img + 1) / 2
+        img = img.permute(0, 2, 3, 1).mul_(255).to(torch.uint8).flip(dims=(3,))
+        
+        if collect_attention_maps:
+            return ret, idx_Bl_list, img, attention_results
+        else:
+            return ret, idx_Bl_list, img
+    
+    
+    @torch.no_grad()
+    def infer_cfg2(
+        self,
+        *,
+        excel_path: str,
+        vae=None,
+        scale_schedule=None,
+        label_B_or_BLT=None,
+        B=1, negative_label_B_or_BLT=None, force_gt_Bhw=None,
+        g_seed=None, cfg_list=[], tau_list=[], cfg_sc=3, top_k=0, top_p=0.0,
+        returns_vemb=0, ratio_Bl1=None, gumbel=0, norm_cfg=False,
+        cfg_exp_k: float=0.0, cfg_insertion_layer=[-5],
+        vae_type=0, softmax_merge_topk=-1, ret_img=False,
+        trunk_scale=1000,
+        gt_leak=0, gt_ls_Bl=None,
+        inference_mode=False,
+        save_img_path=None,
+        sampling_per_bits=1,
+    ):
+        """
+        与 autoregressive_infer_cfg 相同的推理流程，但额外记录每个 stage × block 的
+        attention/ffn/other/total 时间（毫秒），并写入 excel_path（.xlsx）。
+        返回与 autoregressive_infer_cfg 相同: (ret, idx_Bl_list, img)
+        """
+        def _sync_cuda():
+            if torch.cuda.is_available():
+                torch.cuda.synchronize()
+        
+        # 用于统计：列表里每个元素是一条记录（一个stage×block）
+        timing_rows = []  # dict(stage, block, attn_ms, ffn_ms, other_ms, total_ms, seq_len)
+
+        # ========= 以下基本照搬 autoregressive_infer_cfg，穿插计时 =========
+        if g_seed is None: rng = None
+        else: self.rng.manual_seed(g_seed); rng = self.rng
+        assert len(cfg_list) >= len(scale_schedule)
+        assert len(tau_list) >= len(scale_schedule)
+
+        if self.apply_spatial_patchify:
+            vae_scale_schedule = [(pt, 2*ph, 2*pw) for pt, ph, pw in scale_schedule]
+        else:
+            vae_scale_schedule = scale_schedule
+        
+        kv_compact, lens, cu_seqlens_k, max_seqlen_k = label_B_or_BLT
+        if any(np.array(cfg_list) != 1):
+            bs = 2*B
+            if not negative_label_B_or_BLT:
+                kv_compact_un = kv_compact.clone()
+                total = 0
+                for le in lens:
+                    kv_compact_un[total:total+le] = (self.cfg_uncond)[:le]
+                    total += le
+                kv_compact = torch.cat((kv_compact, kv_compact_un), dim=0)
+                cu_seqlens_k = torch.cat((cu_seqlens_k, cu_seqlens_k[1:]+cu_seqlens_k[-1]), dim=0)
+            else:
+                kv_compact_un, lens_un, cu_seqlens_k_un, max_seqlen_k_un = negative_label_B_or_BLT
+                kv_compact = torch.cat((kv_compact, kv_compact_un), dim=0)
+                cu_seqlens_k = torch.cat((cu_seqlens_k, cu_seqlens_k_un[1:]+cu_seqlens_k[-1]), dim=0)
+                max_seqlen_k = max(max_seqlen_k, max_seqlen_k_un)
+        else:
+            bs = B
+
+        kv_compact = self.text_norm(kv_compact)
+        sos = cond_BD = self.text_proj_for_sos((kv_compact, cu_seqlens_k, max_seqlen_k))
+        kv_compact = self.text_proj_for_ca(kv_compact)
+        ca_kv = kv_compact, cu_seqlens_k, max_seqlen_k
+        last_stage = sos.unsqueeze(1).expand(bs, 1, -1) + self.pos_start.expand(bs, 1, -1)
+
+        with torch.amp.autocast('cuda', enabled=False):
+            cond_BD_or_gss = self.shared_ada_lin(cond_BD.float()).float().contiguous()
+        accu_BChw, cur_L, ret = None, 0, []
+        idx_Bl_list, idx_Bld_list = [], []
+
+        if inference_mode:
+            for b in self.unregistered_blocks: (b.sa if isinstance(b, CrossAttnBlock) else b.attn).kv_caching(True)
+        else:
+            assert self.num_block_chunks > 1
+            for block_chunk_ in self.block_chunks:
+                for module in block_chunk_.module.module:
+                    (module.sa if isinstance(module, CrossAttnBlock) else module.attn).kv_caching(True)
+        
+        abs_cfg_insertion_layers = []
+        add_cfg_on_logits, add_cfg_on_probs = False, False
+        leng = len(self.unregistered_blocks)
+        for item in cfg_insertion_layer:
+            if item == 0:
+                add_cfg_on_logits = True
+            elif item == 1:
+                add_cfg_on_probs = True
+            elif item < 0:
+                assert leng+item > 0, f'cfg_insertion_layer: {item} is not valid since len(unregistered_blocks)={self.num_block_chunks}'
+                abs_cfg_insertion_layers.append(leng+item)
+            else:
+                raise ValueError(f'cfg_insertion_layer: {item} is not valid')
+        
+        num_stages_minus_1 = len(scale_schedule)-1
+        summed_codes = 0
+
+        # 全局层计数（与你的 layer_idx 一致）：按“遍历所有 chunk 内的 module”的顺序累加
+        # 我们用它来标识 block 编号
+        for si, pn in enumerate(scale_schedule):
+            cfg = cfg_list[si]
+            if si >= trunk_scale:
+                break
+            cur_L += np.array(pn).prod()
+
+            need_to_pad = 0
+            attn_fn = None
+            if self.use_flex_attn:
+                attn_fn = self.attn_fn_compile_dict.get(tuple(scale_schedule[:(si+1)]), None)
+
+            layer_idx = 0  # 每个 stage 都从 0 开始编号 block（如果你更想全局编号，把它移到 stage 外即可）
+            for block_idx, b in enumerate(self.block_chunks):
+                if self.add_lvl_embeding_only_first_block and block_idx == 0:
+                    last_stage = self.add_lvl_embeding(last_stage, si, scale_schedule, need_to_pad=need_to_pad)
+                if not self.add_lvl_embeding_only_first_block: 
+                    last_stage = self.add_lvl_embeding(last_stage, si, scale_schedule, need_to_pad=need_to_pad)
+                
+                for m in b.module:
+                    # === 为该 block 注册 hooks 做细粒度计时 ===
+                    attn_elapsed_ms = 0.0
+                    ffn_elapsed_ms = 0.0
+
+                    hook_handles = []
+
+                    # 可能存在的注意力模块：CrossAttnBlock 有 sa/ca；SelfAttnBlock 只有 attn
+                    attn_modules = []
+                    if hasattr(m, "sa"): attn_modules.append(m.sa)
+                    if hasattr(m, "ca"): attn_modules.append(m.ca)
+                    if hasattr(m, "attn"): attn_modules.append(m.attn)
+
+                    # 统一把 attention 的 (pre, post) hook 累加到 attn_elapsed_ms
+                    def _mk_attn_pre():
+                        def _pre(*args, **kwargs):
+                            _sync_cuda()
+                            args[0]._timing_t0 = time.time()
+                        return _pre
+                    def _mk_attn_post():
+                        def _post(*args, **kwargs):
+                            nonlocal attn_elapsed_ms
+                            _sync_cuda()
+                            t0 = getattr(args[0], "_timing_t0", None)
+                            if t0 is not None:
+                                attn_elapsed_ms += (time.time() - t0) * 1000.0
+                                delattr(args[0], "_timing_t0")
+                        return _post
+
+                    for am in attn_modules:
+                        try:
+                            hook_handles.append(am.register_forward_pre_hook(_mk_attn_pre()))
+                            hook_handles.append(am.register_forward_hook(_mk_attn_post()))
+                        except Exception:
+                            pass  # 某些包装层可能不支持 hook
+
+                    # FFN/MLP 计时
+                    def _mk_ffn_pre():
+                        def _pre(*args, **kwargs):
+                            _sync_cuda()
+                            args[0]._ffn_t0 = time.time()
+                        return _pre
+                    def _mk_ffn_post():
+                        def _post(*args, **kwargs):
+                            nonlocal ffn_elapsed_ms
+                            _sync_cuda()
+                            t0 = getattr(args[0], "_ffn_t0", None)
+                            if t0 is not None:
+                                ffn_elapsed_ms += (time.time() - t0) * 1000.0
+                                delattr(args[0], "_ffn_t0")
+                        return _post
+
+                    if hasattr(m, "ffn") and m.ffn is not None:
+                        try:
+                            hook_handles.append(m.ffn.register_forward_pre_hook(_mk_ffn_pre()))
+                            hook_handles.append(m.ffn.register_forward_hook(_mk_ffn_post()))
+                        except Exception:
+                            pass
+
+                    # 整个 block 的总耗时
+                    _sync_cuda()
+                    t_block0 = time.time()
+                    last_stage = m(
+                        x=last_stage, cond_BD=cond_BD_or_gss, ca_kv=ca_kv,
+                        attn_bias_or_two_vector=None, attn_fn=attn_fn,
+                        scale_schedule=scale_schedule, rope2d_freqs_grid=self.rope2d_freqs_grid, scale_ind=si
+                    )
+                    _sync_cuda()
+                    total_ms = (time.time() - t_block0) * 1000.0
+
+                    # 清理 hooks
+                    for hh in hook_handles:
+                        try: hh.remove()
+                        except Exception: pass
+
+                    # classifier-free guidance 插入点（保持与原逻辑一致）
+                    if (cfg != 1) and (layer_idx in abs_cfg_insertion_layers):
+                        last_stage = cfg * last_stage[:B] + (1-cfg) * last_stage[B:]
+                        last_stage = torch.cat((last_stage, last_stage), 0)
+
+                    # 计算 other
+                    other_ms = total_ms - attn_elapsed_ms - ffn_elapsed_ms
+                    if other_ms < 0: other_ms = 0.0  # 数值误差保护
+
+                    # 记录
+                    timing_rows.append(dict(
+                        stage=si, block=layer_idx,
+                        attn_ms=float(attn_elapsed_ms),
+                        ffn_ms=float(ffn_elapsed_ms),
+                        other_ms=float(other_ms),
+                        total_ms=float(total_ms),
+                        seq_len=int(np.array(scale_schedule[si]).prod())
+                    ))
+
+                    layer_idx += 1  # 该 stage 内 block 号自增
+            
+            # ======= 以下保持与原推理一致 =======
+            if (cfg != 1) and (0 in cfg_insertion_layer):
+                logits_BlV = self.get_logits(last_stage, cond_BD).mul(1/tau_list[si])
+                logits_BlV = cfg * logits_BlV[:B] + (1-cfg) * logits_BlV[B:]
+            else:
+                logits_BlV = self.get_logits(last_stage[:B], cond_BD[:B]).mul(1/tau_list[si])
+            
+            if self.use_bit_label:
+                tmp_bs, tmp_seq_len = logits_BlV.shape[:2]
+                logits_BlV = logits_BlV.reshape(tmp_bs, -1, 2)
+                idx_Bld = sample_with_top_k_top_p_also_inplace_modifying_logits_(
+                    logits_BlV, rng=rng, top_k=top_k or self.top_k,
+                    top_p=top_p or self.top_p, num_samples=1
+                )[:, :, 0]
+                idx_Bld = idx_Bld.reshape(tmp_bs, tmp_seq_len, -1)
+            else:
+                idx_Bl = sample_with_top_k_top_p_also_inplace_modifying_logits_(
+                    logits_BlV, rng=rng, top_k=top_k or self.top_k,
+                    top_p=top_p or self.top_p, num_samples=1
+                )[:, :, 0]
+            if vae_type != 0:
+                assert returns_vemb
+                if si < gt_leak:
+                    idx_Bld = gt_ls_Bl[si]
+                else:
+                    assert pn[0] == 1
+                    idx_Bld = idx_Bld.reshape(B, pn[1], pn[2], -1)
+                    if self.apply_spatial_patchify:
+                        idx_Bld = idx_Bld.permute(0,3,1,2)
+                        idx_Bld = torch.nn.functional.pixel_shuffle(idx_Bld, 2)
+                        idx_Bld = idx_Bld.permute(0,2,3,1)
+                    idx_Bld = idx_Bld.unsqueeze(1)
+                idx_Bld_list.append(idx_Bld)
+                codes = vae.quantizer.lfq.indices_to_codes(idx_Bld, label_type='bit_label')
+                if si != num_stages_minus_1:
+                    summed_codes += F.interpolate(codes, size=vae_scale_schedule[-1], mode=vae.quantizer.z_interplote_up)
+                    last_stage = F.interpolate(summed_codes, size=vae_scale_schedule[si+1], mode=vae.quantizer.z_interplote_up)
+                    last_stage = last_stage.squeeze(-3)
+                    if self.apply_spatial_patchify:
+                        last_stage = torch.nn.functional.pixel_unshuffle(last_stage, 2)
+                    last_stage = last_stage.reshape(*last_stage.shape[:2], -1)
+                    last_stage = torch.permute(last_stage, [0,2,1])
+                else:
+                    summed_codes += codes
+            else:
+                if si < gt_leak:
+                    idx_Bl = gt_ls_Bl[si]
+                h_BChw = self.quant_only_used_in_inference[0].embedding(idx_Bl).float()
+                h_BChw = h_BChw.transpose_(1, 2).reshape(B, self.d_vae, scale_schedule[si][0], scale_schedule[si][1], scale_schedule[si][2])
+                ret.append(h_BChw if returns_vemb != 0 else idx_Bl)
+                idx_Bl_list.append(idx_Bl)
+                if si != num_stages_minus_1:
+                    accu_BChw, last_stage = self.quant_only_used_in_inference[0].one_step_fuse(
+                        si, num_stages_minus_1+1, accu_BChw, h_BChw, scale_schedule
+                    )
+            if si != num_stages_minus_1:
+                last_stage = self.word_embed(self.norm0_ve(last_stage))
+                last_stage = last_stage.repeat(bs//B, 1, 1)
+
+        if inference_mode:
+            for b in self.unregistered_blocks: (b.sa if isinstance(b, CrossAttnBlock) else b.attn).kv_caching(False)
+        else:
+            assert self.num_block_chunks > 1
+            for block_chunk_ in self.block_chunks:
+                for module in block_chunk_.module.module:
+                    (module.sa if isinstance(module, CrossAttnBlock) else module.attn).kv_caching(False)
+
+        # ===== 写 Excel =====
+        try:
+            df = pd.DataFrame(timing_rows, columns=[
+                "stage", "block", "attn_ms", "ffn_ms", "other_ms", "total_ms", "seq_len"
+            ])
+            # 多加一点实用汇总：同 stage 的平均值与总和
+            with pd.ExcelWriter(excel_path, engine="openpyxl") as writer:
+                df.to_excel(writer, sheet_name="per_block", index=False)
+                df_stage = df.groupby("stage", as_index=False).agg({
+                    "attn_ms":"sum","ffn_ms":"sum","other_ms":"sum","total_ms":"sum"
+                })
+                df_stage_avg = df.groupby("stage", as_index=False).agg({
+                    "attn_ms":"mean","ffn_ms":"mean","other_ms":"mean","total_ms":"mean"
+                }).rename(columns={
+                    "attn_ms":"attn_ms_avg","ffn_ms":"ffn_ms_avg",
+                    "other_ms":"other_ms_avg","total_ms":"total_ms_avg"
+                })
+                df_stage.to_excel(writer, sheet_name="sum_by_stage", index=False)
+                df_stage_avg.to_excel(writer, sheet_name="avg_by_stage", index=False)
+        except Exception as e:
+            print(f"[infer_cfg2] Failed to write excel to {excel_path}: {e}", flush=True)
 
         if not ret_img:
             return ret, idx_Bl_list, []
@@ -639,7 +1106,335 @@ class Infinity(nn.Module):
 
         img = (img + 1) / 2
         img = img.permute(0, 2, 3, 1).mul_(255).to(torch.uint8).flip(dims=(3,))
+
         return ret, idx_Bl_list, img
+    
+    
+    @torch.no_grad()
+    def infer_cfg3_power(
+        self,
+        *,
+        csv_path: str,             # 仅写 CSV（不输出 Excel/图片）
+        vae=None,
+        scale_schedule=None,
+        label_B_or_BLT=None,
+        B=1, negative_label_B_or_BLT=None, force_gt_Bhw=None,
+        g_seed=None, cfg_list=[], tau_list=[], cfg_sc=3, top_k=0, top_p=0.0,
+        returns_vemb=0, ratio_Bl1=None, gumbel=0, norm_cfg=False,
+        cfg_exp_k: float=0.0, cfg_insertion_layer=[-5],
+        vae_type=0, softmax_merge_topk=-1, ret_img=False,
+        trunk_scale=1000,
+        gt_leak=0, gt_ls_Bl=None,
+        inference_mode=False,
+        sampling_per_bits=1,
+        power_hz: float = 50.0,           # NVML 采样频率（建议 20~50）
+        device_index: int = 0,            # NVML GPU index
+        win_pad_ratio: float = 0.35,      # 每个能量窗口两端 padding 比例
+        win_pad_min: float = 0.015,       # 每边最小 padding 秒
+    ):
+        """
+        记录每个 stage×block 的能量 (J)：
+          - attn_J：该 block 内注意力子模块（sa/attn/ca）能量之和
+          - ffn_J ：该 block 内 FFN 子模块能量
+          - other_J：total_J - attn_J - ffn_J（小于 0 会夹到 0）
+          - total_J：整个 block 前后能量窗口（带 padding）
+        与 autoregressive_infer_cfg 语义一致（本函数不输出图片）。
+        """
+        def _sync():
+            if torch.cuda.is_available():
+                torch.cuda.synchronize()
+
+        # ===== 启动 NVML 采样 =====
+        meter = PowerMeter(device_index=device_index, hz=power_hz)
+        meter.start(warmup_ms=150.0)
+        time.sleep(0.1)  # 轻度预热
+        rows = []
+
+        # ===== 前置，与 autoregressive_infer_cfg 对齐 =====
+        rng = None
+        if g_seed is not None:
+            self.rng.manual_seed(g_seed)
+            rng = self.rng
+
+        assert len(cfg_list) >= len(scale_schedule)
+        assert len(tau_list) >= len(scale_schedule)
+
+        # Infinity 的 scale vs VAE 的 scale
+        if self.apply_spatial_patchify:
+            vae_scale_schedule = [(pt, 2*ph, 2*pw) for pt, ph, pw in scale_schedule]
+        else:
+            vae_scale_schedule = scale_schedule
+
+        kv_compact, lens, cu_seqlens_k, max_seqlen_k = label_B_or_BLT
+
+        # === CFG 情况下拼接条件 ===
+        if any(np.array(cfg_list) != 1):
+            bs = 2 * B
+            if not negative_label_B_or_BLT:
+                kv_compact_un = kv_compact.clone()
+                total = 0
+                for le in lens:
+                    kv_compact_un[total:total+le] = (self.cfg_uncond)[:le]
+                    total += le
+                kv_compact = torch.cat((kv_compact, kv_compact_un), dim=0)
+                cu_seqlens_k = torch.cat((cu_seqlens_k, cu_seqlens_k[1:] + cu_seqlens_k[-1]), dim=0)
+            else:
+                kv_compact_un, lens_un, cu_seqlens_k_un, max_seqlen_k_un = negative_label_B_or_BLT
+                kv_compact = torch.cat((kv_compact, kv_compact_un), dim=0)
+                cu_seqlens_k = torch.cat((cu_seqlens_k, cu_seqlens_k_un[1:] + cu_seqlens_k[-1]), dim=0)
+                max_seqlen_k = max(max_seqlen_k, max_seqlen_k_un)
+        else:
+            bs = B
+
+        kv_compact = self.text_norm(kv_compact)
+        sos = cond_BD = self.text_proj_for_sos((kv_compact, cu_seqlens_k, max_seqlen_k))
+        kv_compact = self.text_proj_for_ca(kv_compact)
+        ca_kv = kv_compact, cu_seqlens_k, max_seqlen_k
+        last_stage = sos.unsqueeze(1).expand(bs, 1, -1) + self.pos_start.expand(bs, 1, -1)
+
+        with torch.amp.autocast('cuda', enabled=False):
+            cond_BD_or_gss = self.shared_ada_lin(cond_BD.float()).float().contiguous()
+
+        # === 启/关 KV cache 一致化 ===
+        if inference_mode:
+            for b in self.unregistered_blocks:
+                (b.sa if isinstance(b, CrossAttnBlock) else b.attn).kv_caching(True)
+        else:
+            assert self.num_block_chunks > 1
+            for block_chunk_ in self.block_chunks:
+                for module in block_chunk_.module.module:
+                    (module.sa if isinstance(module, CrossAttnBlock) else module.attn).kv_caching(True)
+
+        # 插入层位置解析
+        abs_cfg_insertion_layers = []
+        add_cfg_on_logits, add_cfg_on_probs = False, False
+        leng = len(self.unregistered_blocks)
+        for item in cfg_insertion_layer:
+            if item == 0:
+                add_cfg_on_logits = True
+            elif item == 1:
+                add_cfg_on_probs = True
+            elif item < 0:
+                assert leng + item > 0, f'cfg_insertion_layer: {item} is not valid since len(unregistered_blocks)={self.num_block_chunks}'
+                abs_cfg_insertion_layers.append(leng + item)
+            else:
+                raise ValueError(f'cfg_insertion_layer: {item} is not valid')
+
+        num_stages_minus_1 = len(scale_schedule) - 1
+        summed_codes = 0
+        accu_BChw, cur_L, ret = None, 0, []
+        idx_Bl_list, idx_Bld_list = [], []
+
+        # ===== 主循环：逐 stage =====
+        for si, pn in enumerate(scale_schedule):
+            cfg = cfg_list[si]
+            if si >= trunk_scale:
+                break
+            cur_L += np.array(pn).prod()
+
+            attn_fn = None
+            if self.use_flex_attn:
+                attn_fn = self.attn_fn_compile_dict.get(tuple(scale_schedule[:(si+1)]), None)
+
+            # 逐 block（保持与 forward 路径一致）
+            layer_idx = 0
+            for block_idx, b in enumerate(self.block_chunks):
+                # -------- 关键修复：计算 need_to_pad 并传入 add_lvl_embeding --------
+                scale_seq_len = int(np.array(scale_schedule[si]).prod())
+                seq_len_now = last_stage.shape[1]
+                need_to_pad = max(0, seq_len_now - scale_seq_len)
+                # ------------------------------------------------------------------
+
+                if self.add_lvl_embeding_only_first_block and block_idx == 0:
+                    last_stage = self.add_lvl_embeding(last_stage, si, scale_schedule, need_to_pad=need_to_pad)
+                if not self.add_lvl_embeding_only_first_block:
+                    last_stage = self.add_lvl_embeding(last_stage, si, scale_schedule, need_to_pad=need_to_pad)
+
+                for m in b.module:
+                    # --- 子模块能量（先收集时间段，块结束后统一积分） ---
+                    attn_spans = []
+                    ffn_spans  = []
+
+                    def _mk_span_recorder(which):
+                        box = {"t0": None}
+                        def _pre(*_a, **_k):
+                            _sync(); box["t0"] = meter.now()
+                        def _post(*_a, **_k):
+                            _sync()
+                            t1 = meter.now()
+                            t0 = box["t0"] or t1
+                            if which == "attn":
+                                attn_spans.append((t0, t1))
+                            else:
+                                ffn_spans.append((t0, t1))
+                        return _pre, _post
+
+                    hooks = []
+                    if hasattr(m, "sa"):
+                        pre, post = _mk_span_recorder("attn")
+                        hooks += [m.sa.register_forward_pre_hook(pre),
+                                  m.sa.register_forward_hook(post)]
+                    if hasattr(m, "attn"):
+                        pre, post = _mk_span_recorder("attn")
+                        hooks += [m.attn.register_forward_pre_hook(pre),
+                                  m.attn.register_forward_hook(post)]
+                    if hasattr(m, "ca"):
+                        pre, post = _mk_span_recorder("attn")
+                        hooks += [m.ca.register_forward_pre_hook(pre),
+                                  m.ca.register_forward_hook(post)]
+                    if hasattr(m, "ffn") and m.ffn is not None:
+                        pre, post = _mk_span_recorder("ffn")
+                        hooks += [m.ffn.register_forward_pre_hook(pre),
+                                  m.ffn.register_forward_hook(post)]
+
+                    # --- 整个 block 的能量窗口（带 padding） ---
+                    _sync(); t0_blk = meter.now()
+                    last_stage = m(
+                        x=last_stage, cond_BD=cond_BD_or_gss, ca_kv=ca_kv,
+                        attn_bias_or_two_vector=None, attn_fn=attn_fn,
+                        scale_schedule=scale_schedule, rope2d_freqs_grid=self.rope2d_freqs_grid, scale_ind=si
+                    )
+                    if (cfg != 1) and (layer_idx in abs_cfg_insertion_layers):
+                        last_stage = cfg * last_stage[:B] + (1 - cfg) * last_stage[B:]
+                        last_stage = torch.cat((last_stage, last_stage), 0)
+                    _sync(); t1_blk = meter.now()
+
+                    for h in hooks:
+                        try: h.remove()
+                        except Exception: pass
+
+                    # === 块结束后统一积分 ===
+                    dur_blk = max(t1_blk - t0_blk, 1e-6)
+                    pad_blk = max(dur_blk * win_pad_ratio, win_pad_min)
+                    tL_blk, tR_blk = (t0_blk - pad_blk), (t1_blk + pad_blk)
+
+                    def _merge_and_integrate(spans):
+                        """对子模块 spans 轻度 padding、裁剪到 block 窗口后做并集积分。"""
+                        if not spans:
+                            return 0.0
+                        sub_pad = max(dur_blk * (win_pad_ratio * 0.2), win_pad_min * 0.5)
+                        segs = []
+                        for (a, b) in spans:
+                            if b <= a:
+                                continue
+                            L = max(tL_blk, a - sub_pad)
+                            R = min(tR_blk, b + sub_pad)
+                            if R > L:
+                                segs.append((L, R))
+                        if not segs:
+                            return 0.0
+                        segs.sort()
+                        merged = [segs[0]]
+                        for s, e in segs[1:]:
+                            ls, le = merged[-1]
+                            if s <= le:
+                                merged[-1] = (ls, max(le, e))
+                            else:
+                                merged.append((s, e))
+                        energy = 0.0
+                        for s, e in merged:
+                            energy += meter.energy_between(s, e)
+                        return float(energy)
+
+                    attn_J = _merge_and_integrate(attn_spans)
+                    ffn_J  = _merge_and_integrate(ffn_spans)
+                    total_J = meter.energy_between(tL_blk, tR_blk)
+                    other_J = max(0.0, float(total_J) - attn_J - ffn_J)
+
+                    rows.append(dict(
+                        stage=si, block=layer_idx,
+                        attn_J=float(attn_J), ffn_J=float(ffn_J),
+                        other_J=float(other_J), total_J=float(total_J),
+                        seq_len=int(np.array(scale_schedule[si]).prod()),
+                    ))
+
+                    layer_idx += 1
+
+            # ===== 与 autoregressive_infer_cfg 一致的余下流程（采样 / 解码） =====
+            if (cfg != 1) and (0 in cfg_insertion_layer):
+                logits_BlV = self.get_logits(last_stage, cond_BD).mul(1/tau_list[si])
+                logits_BlV = cfg * logits_BlV[:B] + (1-cfg) * logits_BlV[B:]
+            else:
+                logits_BlV = self.get_logits(last_stage[:B], cond_BD[:B]).mul(1/tau_list[si])
+
+            if self.use_bit_label:
+                tmp_bs, tmp_seq_len = logits_BlV.shape[:2]
+                logits_BlV = logits_BlV.reshape(tmp_bs, -1, 2)
+                idx_Bld = sample_with_top_k_top_p_also_inplace_modifying_logits_(
+                    logits_BlV, rng=rng, top_k=top_k or self.top_k, top_p=top_p or self.top_p, num_samples=1
+                )[:, :, 0]
+                idx_Bld = idx_Bld.reshape(tmp_bs, tmp_seq_len, -1)
+            else:
+                idx_Bl = sample_with_top_k_top_p_also_inplace_modifying_logits_(
+                    logits_BlV, rng=rng, top_k=top_k or self.top_k, top_p=top_p or self.top_p, num_samples=1
+                )[:, :, 0]
+
+            if vae_type != 0:
+                assert returns_vemb
+                if si < gt_leak:
+                    idx_Bld = gt_ls_Bl[si]
+                else:
+                    assert pn[0] == 1
+                    idx_Bld = idx_Bld.reshape(B, pn[1], pn[2], -1)
+                    if self.apply_spatial_patchify:
+                        idx_Bld = idx_Bld.permute(0,3,1,2)
+                        idx_Bld = torch.nn.functional.pixel_shuffle(idx_Bld, 2)
+                        idx_Bld = idx_Bld.permute(0,2,3,1)
+                    idx_Bld = idx_Bld.unsqueeze(1)
+
+                idx_Bld_list.append(idx_Bld)
+                codes = vae.quantizer.lfq.indices_to_codes(idx_Bld, label_type='bit_label')
+                if si != num_stages_minus_1:
+                    summed_codes += F.interpolate(codes, size=vae_scale_schedule[-1], mode=vae.quantizer.z_interplote_up)
+                    last_stage = F.interpolate(summed_codes, size=vae_scale_schedule[si+1], mode=vae.quantizer.z_interplote_up)
+                    last_stage = last_stage.squeeze(-3)
+                    if self.apply_spatial_patchify:
+                        last_stage = torch.nn.functional.pixel_unshuffle(last_stage, 2)
+                    last_stage = last_stage.reshape(*last_stage.shape[:2], -1)
+                    last_stage = torch.permute(last_stage, [0,2,1])
+                else:
+                    summed_codes += codes
+            else:
+                if si < gt_leak:
+                    idx_Bl = gt_ls_Bl[si]
+                h_BChw = self.quant_only_used_in_inference[0].embedding(idx_Bl).float()
+                h_BChw = h_BChw.transpose_(1, 2).reshape(B, self.d_vae, scale_schedule[si][0], scale_schedule[si][1], scale_schedule[si][2])
+                ret.append(h_BChw if returns_vemb != 0 else idx_Bl)
+                idx_Bl_list.append(idx_Bl)
+                if si != num_stages_minus_1:
+                    accu_BChw, last_stage = self.quant_only_used_in_inference[0].one_step_fuse(
+                        si, num_stages_minus_1+1, accu_BChw, h_BChw, scale_schedule
+                    )
+
+            if si != num_stages_minus_1:
+                last_stage = self.word_embed(self.norm0_ve(last_stage))
+                last_stage = last_stage.repeat(bs // B, 1, 1)
+
+        # === 关闭 kv cache ===
+        if inference_mode:
+            for b in self.unregistered_blocks:
+                (b.sa if isinstance(b, CrossAttnBlock) else b.attn).kv_caching(False)
+        else:
+            assert self.num_block_chunks > 1
+            for block_chunk_ in self.block_chunks:
+                for module in block_chunk_.module.module:
+                    (module.sa if isinstance(module, CrossAttnBlock) else module.attn).kv_caching(False)
+
+        # ===== 停止 NVML，并写 CSV =====
+        meter.stop()
+        try:
+            df = pd.DataFrame(rows, columns=["stage","block","attn_J","ffn_J","other_J","total_J","seq_len"])
+            dir_ = os.path.dirname(csv_path)
+            if dir_:
+                os.makedirs(dir_, exist_ok=True)
+            df.to_csv(csv_path, index=False)
+            print(f"[infer_cfg3_power] wrote {csv_path} (rows={len(df)})")
+        except Exception as e:
+            print(f"[infer_cfg3_power] CSV write failed: {e}")
+
+        return rows
+
+
     
     @for_visualize
     def vis_key_params(self, ep):

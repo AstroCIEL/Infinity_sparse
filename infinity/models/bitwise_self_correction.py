@@ -4,6 +4,7 @@ import os.path as osp
 import torch
 import torch.nn.functional as F
 import numpy as np
+import cv2
 
 
 def labels2image(all_indices, label_type='int_label', scale_schedule=None):

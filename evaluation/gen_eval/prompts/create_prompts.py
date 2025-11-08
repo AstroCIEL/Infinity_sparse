@@ -11,7 +11,7 @@ import numpy as np
 
 # Load classnames
 
-with open("object_names.txt") as cls_file:
+with open("/DISK1/home/yx_zhao31/Infinity/evaluation/gen_eval/prompts/object_names.txt") as cls_file:
     classnames = [line.strip() for line in cls_file]
 
 # Proper a vs an
@@ -176,7 +176,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--seed", type=int, default=43, help="generation seed (default: 43)")
     parser.add_argument("--num-prompts", "-n", type=int, default=100, help="number of prompts per task (default: 100)")
-    parser.add_argument("--output-path", "-o", type=str, default="prompts", help="output folder for prompts and metadata (default: 'prompts/')")
+    parser.add_argument("--output-path", "-o", type=str, default="/DISK1/home/yx_zhao31/Infinity/evaluation/gen_eval/prompts", help="output folder for prompts and metadata (default: 'prompts/')")
     args = parser.parse_args()
     rng = np.random.default_rng(args.seed)
     generate_suite(rng, args.num_prompts, args.output_path)
