@@ -18,7 +18,6 @@ import pandas as pd
 from transformers import AutoTokenizer, T5EncoderModel, T5TokenizerFast
 from PIL import Image, ImageEnhance
 import torch.nn.functional as F
-from torch.cuda.amp import autocast
 import sys, os
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -429,7 +428,8 @@ def load_infinity(
     bf16=False,
     checkpoint_type='torch',
     customized_flash_attn=False,
-    sparsity_ratio=None
+    sparsity_ratio_sa=None,
+    sparsity_ratio_ca=None
 ):
     print(f'[Loading Infinity]')
     text_maxlen = 512
@@ -450,7 +450,8 @@ def load_infinity(
             apply_spatial_patchify=apply_spatial_patchify,
             inference_mode=True,
             train_h_div_w_list=[1.0],
-            sparsity_ratio=sparsity_ratio,
+            sparsity_ratio_sa=sparsity_ratio_sa,
+            sparsity_ratio_ca=sparsity_ratio_ca,
             **model_kwargs,
         ).to(device=device)
         print(f'[you selected Infinity with {model_kwargs=}] model size: {sum(p.numel() for p in infinity_test.parameters())/1e9:.2f}B, bf16={bf16}')
@@ -604,7 +605,8 @@ def load_transformer(vae, args):
         bf16=args.bf16,
         checkpoint_type=args.checkpoint_type,
         customized_flash_attn=args.customized_flash_attn,
-        sparsity_ratio=args.sparsity_ratio
+        sparsity_ratio_sa=args.sparsity_ratio_sa,
+        sparsity_ratio_ca=args.sparsity_ratio_ca
     )
     return infinity
 
@@ -635,7 +637,8 @@ def add_common_arguments(parser):
     parser.add_argument('--seed', type=int, default=0)
     parser.add_argument('--bf16', type=int, default=1, choices=[0,1])
     parser.add_argument('--customized_flash_attn', type=bool, default=False)
-    parser.add_argument('--sparsity_ratio', type=float, default=None)
+    parser.add_argument('--sparsity_ratio_sa', type=float, default=None)
+    parser.add_argument('--sparsity_ratio_ca', type=float, default=None)
     if not any(opt.option_strings == ['--enable_model_cache'] for opt in parser._actions):
         parser.add_argument("--enable_model_cache", action="store_true", default=True, help="Enable local model cache.")
 
@@ -664,7 +667,7 @@ if __name__ == '__main__':
     scale_schedule = dynamic_resolution_h_w[args.h_div_w_template][args.pn]['scales']
     scale_schedule = [ (1, h, w) for (_, h, w) in scale_schedule]
 
-    with autocast(dtype=torch.bfloat16):
+    with torch.amp.autocast('cuda',dtype=torch.bfloat16):
         with torch.no_grad():
             generated_image = gen_one_img(
                 infinity,

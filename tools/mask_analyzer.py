@@ -39,7 +39,6 @@ class SparsityMaskAnalyzer:
             print(f"成功加载数据: {self.pkl_path}")
             print(f"总stage数: {self.mask_data['metadata']['total_stages']}")
             print(f"总block数: {self.mask_data['metadata']['total_blocks']}")
-            print(f"稀疏比例: {self.mask_data['metadata']['sparsity_ratio']}")
         except Exception as e:
             print(f"加载数据失败: {e}")
             self.mask_data = None
