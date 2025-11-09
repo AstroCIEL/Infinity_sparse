@@ -424,12 +424,14 @@ class SparseSelfAttention(nn.Module):
         Returns:
             tuple: (attn_sparse, sparsity_mask)
         """
-        if sparsity_ratio <= 0:
+        B, H, Lq, Lk = attention_weights.shape
+        
+        if sparsity_ratio <= 0 or Lq < 144:  # stage <=4, no sparsity
             # 如果不需要稀疏化，直接返回原始权重和全零 mask
             return attention_weights, torch.zeros_like(attention_weights, dtype=torch.bool)
         
         # attention_weights形状: (B, H, Lq, Lk)
-        B, H, Lq, Lk = attention_weights.shape
+        
         k = max(1, int(Lk * (1 - sparsity_ratio)))
     
         if k >= Lk:

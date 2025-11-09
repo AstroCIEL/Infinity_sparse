@@ -31,15 +31,15 @@ rope2d_normalized_by_hw=2
 add_lvl_embeding_only_first_block=1
 text_channels=2048
 #sparsity_ratio_sa=0.6
+long_caption_fid=0
+coco30k_prompts=0
+total_prompts=9999
 
 # 路径配置
 infinity_model_path=/root/autodl-tmp/Predata/infinity_2b_reg.pth
 vae_path=/root/autodl-tmp/Predata/infinity_vae_d32reg.pth
 text_encoder_ckpt=/root/autodl-tmp/Predata/flan-t5-xl
 jsonl_filepath=/root/autodl-tmp/Predata/coco2014_val_prompts_full.jsonl
-long_caption_fid=0
-coco30k_prompts=0
-total_prompts=9999
 
 # 输出目录
 out_dir_root=/root/autodl-tmp/Infinity_sparse/output/infinity_fid
@@ -161,32 +161,10 @@ COMBINED_COUNT=$(wc -l < "$COMBINED_META" 2>/dev/null || echo "0")
 echo "[INFO] Combined metadata has $COMBINED_COUNT lines"
 
 #############################
-# Step 4: Multi-GPU FID calculation
+# Step 4: FID calculation
 #############################
-echo "[INFO] Calculating FID using ${num_gpus} GPUs..."
+${python_ext} tools/fid_score.py \
+    ${out_dir}/pred \
+    ${out_dir}/gt | tee ${out_dir}/fid_log.txt
 
-${python_ext} tools/fid_score_multi_gpu.py \
-  --batch-size 64 \
-  --dims 2048 \
-  --num-workers 8 \
-  --world-size ${num_gpus} \
-  --dist-url "tcp://localhost:12355" \
-  --dist-backend "nccl" \
-  --max_samples 50000 \
-  ${out_dir}/pred \
-  ${out_dir}/gt
-
-echo "[DONE] Multi-GPU FID evaluation completed. Results saved in ${out_dir}"
-
-# Optional: Compare with single GPU result for verification
-# echo "[INFO] Running single GPU FID for comparison..."
-# ${python_ext} tools/fid_score_multi_gpu.py \
-#   --batch-size 64 \
-#   --dims 2048 \
-#   --num-workers 8 \
-#   --world-size 1 \
-#   --max_samples 50000 \
-#   ${out_dir}/pred \
-#   ${out_dir}/gt | tee ${out_dir}/fid_single_gpu.txt
-
-# echo "[DONE] Comparison completed."
+echo "[DONE] Comparison completed."

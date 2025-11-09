@@ -22,7 +22,6 @@ def process_short_text(short_text):
 def main():
     parser = argparse.ArgumentParser()
     add_common_arguments(parser)
-    parser.add_argument('--rewrite_prompt', type=int, default=0, choices=[0,1])
     parser.add_argument('--out_dir', type=str, default='')
     parser.add_argument('--coco30k_prompts', type=int, default=0, choices=[0,1])
     parser.add_argument('--save4fid_eval', type=int, default=0, choices=[0,1])
