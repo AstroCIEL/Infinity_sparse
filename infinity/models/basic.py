@@ -412,51 +412,61 @@ class SparseSelfAttention(nn.Module):
         self.cached_k = None
         self.cached_v = None
     
-    def _apply_sparsity_to_attention(self, attention_weights, sparsity_ratio=0.25):
+    def _apply_sparsity_to_attention(self,attention_weights, sparsity_ratio=0.25):
         """
-        对attention weights应用稀疏性，将最小的sparsity_ratio比例的值设为0
+        对attention weights应用稀疏性，将最小的sparsity_ratio比例的值设为0。
+        使用PyTorch张量操作进行并行化加速。
+        
+        Args:
+            attention_weights (torch.Tensor): 形状为 (batch_size, num_heads, seq_len_q, seq_len_k) 的注意力权重。
+            sparsity_ratio (float): 要稀疏化的最小比例。
+            
+        Returns:
+            tuple: (attn_sparse, sparsity_mask)
         """
         if sparsity_ratio <= 0:
+            # 如果不需要稀疏化，直接返回原始权重和全零 mask
             return attention_weights, torch.zeros_like(attention_weights, dtype=torch.bool)
         
-        # attention_weights形状: (batch_size, num_heads, seq_len_q, seq_len_k)
-        batch_size, num_heads, seq_len_q, seq_len_k = attention_weights.shape
+        # attention_weights形状: (B, H, Lq, Lk)
+        B, H, Lq, Lk = attention_weights.shape
+        k = max(1, int(Lk * (1 - sparsity_ratio)))
+    
+        if k >= Lk:
+            return attention_weights, torch.zeros_like(attention_weights, dtype=torch.bool)
         
-        # 创建副本以避免原地修改
-        attn_sparse = attention_weights.clone()
-        sparsity_mask = torch.zeros_like(attention_weights, dtype=torch.bool)
+        # 初始化输出张量
+        attn_sparse_normalized = torch.empty_like(attention_weights)
+        sparsity_mask = torch.empty((B, H, Lq, Lk), dtype=torch.bool, device=attention_weights.device)
         
-        # 对每个查询位置独立应用稀疏性
-        for b in range(batch_size):
-            for h in range(num_heads):
-                for q in range(seq_len_q):
-                    attn_row = attn_sparse[b, h, q]  # (seq_len_k,)
-                    
-                    # 计算要保留的最小值数量
-                    k = max(1, int(seq_len_k * (1 - sparsity_ratio)))
-                    if k >= seq_len_k:  # 稀疏比例太小，跳过
-                        continue
-                    
-                    # 找到第k小的值作为阈值
-                    values, indices = torch.topk(attn_row, k, largest=True)
-                    threshold = values[-1] if k > 0 else torch.tensor(0.0)
-                    
-                    # 创建当前行的mask
-                    row_mask = attn_row < threshold
-                    # 应用稀疏性
-                    attn_sparse[b, h, q] = attn_row.masked_fill(row_mask, 0.0)
-                    # 更新sparsity mask
-                    sparsity_mask[b, h, q] = row_mask
-                    
-                    # 重新归一化
-                    row_sum = attn_sparse[b, h, q].sum()
-                    if row_sum > 0:
-                        attn_sparse[b, h, q] = attn_sparse[b, h, q] / row_sum
-                    else:
-                        # 如果全为0，则恢复原始值（避免除零）
-                        attn_sparse[b, h, q] = attention_weights[b, h, q] / attention_weights[b, h, q].sum()
+        epsilon = 1e-12
         
-        return attn_sparse, sparsity_mask
+        # 方法1: 按batch维度拆分（推荐，因为batch通常较小）
+        for b in range(B):
+            batch_attn_weights = attention_weights[b]  # (H, Lq, Lk)
+            
+            # 对每个head进行处理
+            for h in range(H):
+                head_attn_weights = batch_attn_weights[h]  # (Lq, Lk)
+                
+                # 使用topk找到阈值
+                values, _ = torch.topk(head_attn_weights, k=k, dim=-1, largest=True)
+                threshold = values[..., -1].unsqueeze(-1)  # (Lq, 1)
+                
+                # 创建稀疏mask
+                head_mask = head_attn_weights < threshold  # (Lq, Lk)
+                sparsity_mask[b, h] = head_mask
+                
+                # 应用稀疏化
+                head_attn_sparse = head_attn_weights.masked_fill(head_mask, 0.0)
+                
+                # 重新归一化
+                row_sum = head_attn_sparse.sum(dim=-1, keepdim=True)  # (Lq, 1)
+                head_attn_normalized = head_attn_sparse / (row_sum + epsilon)
+                
+                attn_sparse_normalized[b, h] = head_attn_normalized
+        
+        return attn_sparse_normalized, sparsity_mask
     
     def _sparse_dot_product_attention(self, query, key, value, attn_mask=None, scale=None):
         """

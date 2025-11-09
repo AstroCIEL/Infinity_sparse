@@ -32,19 +32,19 @@ add_lvl_embeding_only_first_block=1
 text_channels=2048
 
 # —— 你的权重路径（按你给的路径填好）——
-infinity_model_path=/DISK1/home/yx_zhao31/Infinity/Predata/infinity_2b_reg.pth
-vae_path=/DISK1/home/yx_zhao31/Infinity/Predata/infinity_vae_d32reg.pth
-text_encoder_ckpt=/DISK1/home/yx_zhao31/Infinity/Predata/flan-t5-xl
+infinity_model_path=/root/autodl-tmp/Predata/infinity_2b_reg.pth
+vae_path=/root/autodl-tmp/Predata/infinity_vae_d32reg.pth
+text_encoder_ckpt=/root/autodl-tmp/Predata/flan-t5-xl
 
 # —— 你的 jsonl（短 caption 版本）——
-jsonl_filepath=/DISK1/home/yx_zhao31/Infinity/Predata/coco2014_val_prompts_full.jsonl
+jsonl_filepath=/root/autodl-tmp/Predata/coco2014_val_prompts_full.jsonl
 # 因为上面 jsonl 只有 text + image_path，没有 long_caption，所以置 0
 long_caption_fid=0
 # 不用 COCO30k 内置 prompt
 coco30k_prompts=0
 
 # 输出目录
-out_dir_root=/DISK1/home/yx_zhao31/Infinity/output/infinity_fid
+out_dir_root=/root/autodl-tmp/Infinity_sparse/output/infinity_fid
 sub_fix=cfg${cfg}_tau${tau}_cfg_insertion_layer${cfg_insertion_layer}
 out_dir=${out_dir_root}/val_fid_${sub_fix}
 
