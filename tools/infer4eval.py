@@ -16,7 +16,7 @@ import numpy as np
 from pytorch_lightning import seed_everything
 
 from run_infinity import *
-from conf import HF_TOKEN, HF_HOME
+
 
 # set environment variables
 os.environ['HF_TOKEN'] = HF_TOKEN
