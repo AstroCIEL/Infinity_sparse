@@ -1,4 +1,4 @@
-HF_TOKEN = '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'
+HF_TOKEN = '[YOUR HF_HOME]'
 HF_HOME = '[YOUR HF_HOME]'
 
 GPT_AK = '[YOUR GPT_AK]'
