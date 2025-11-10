@@ -49,7 +49,7 @@ def main():
     if len(args.cfg) == 1:
         args.cfg = args.cfg[0]
 
-    all_prompts = hpsv2.benchmark_prompts(['anime','photo'],download=False)
+    all_prompts = hpsv2.benchmark_prompts('all',download=False)
     
     # 设置随机种子，确保不同GPU生成不同的图片
     seed_everything(args.seed + args.rank)  # 添加rank偏移确保不同GPU生成不同图片
