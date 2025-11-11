@@ -139,7 +139,7 @@ test_gen_eval() {
     # sudo apt install libgl1
     # ${pip_ext} install openai
     # ${pip_ext} install httpx==0.20.0
-    
+
     ####assume you have correct env
     ####download https://download.openmmlab.com/mmdetection/v2.0/mask2former/mask2former_swin-s-p4-w7-224_lsj_8x2_50e_coco/mask2former_swin-s-p4-w7-224_lsj_8x2_50e_coco_20220504_001756-743b7d99.pth -O "$1/mask2former_swin-s-p4-w7-224_lsj_8x2_50e_coco.pth"
     ####and mv to weights/mask2former and rename as mask2former_swin-s-p4-w7-224_lsj_8x2_50e_coco.pth
@@ -201,7 +201,7 @@ echo "[INFO] Total prompts to process: ${total_prompts}"
 
 # maybe you should first generate pics in A env
 test_gen_eval_infer
-# then you evalutae them in B env
+# then you may evalutae them in B env
 test_gen_eval
 
 echo "[DONE] GenEval evaluation completed."
